@@ -8,19 +8,19 @@ environmental correlates — focusing on population aging × environmental expos
 interactions — using spatial regression (INLA BYM2) and machine learning
 (XGBoost with spatial cross-validation and TreeSHAP).
 
-This repository accompanies the manuscript and exists so the results can be
+This repository accompanies the article and exists so the results can be
 reproduced.
 
 ## Contents
 
 | Path | Description |
 |------|-------------|
-| `CKM_US_Main_public.R` | The complete pipeline. Run it top to bottom; it is the only analysis script. It also writes the extended-index refit (eResults in Supplement 1), the eight tables recomputed from the cached fits (`29_*.csv`), and the NaNDA food-store sensitivity analysis (eResults and eTable 5 in Supplement 1; `30_nanda_*.csv`). Section 11 prints seven additional summary values: global Moran's I on the 69,854-tract index (0.657), Cronbach's α (0.917), the NHANES sample size (8,965), the upper boundary knot of the aging spline (92.2%), the residual semivariogram bins, the number of tracts with no PLACES estimate (491), and the variance inflation factors of the Model 1 and Model 2 covariate sets. Section 12 draws the article's maps and the LILA-by-aging figure (Figures 1 and 3; eFigures 3 and 5) in `output/figures_article/`, with tracts that have no CDC PLACES data left blank. Both sections read saved files and fit no model. |
+| `CKM_US_Main_public.R` | The complete pipeline. Run it top to bottom; it is the only analysis script. It also writes the extended-index refit (eResults in Supplement 1), the eight tables recomputed from the cached fits (`29_*.csv`), and the NaNDA food-store sensitivity analysis (eResults and eTable 5 in Supplement 1; `30_nanda_*.csv`). Section 11 prints six additional summary values: global Moran's I on the 69,854-tract index (0.657), Cronbach's α (0.917), the NHANES sample size (8,965), the upper boundary knot of the aging spline (92.2%), the number of tracts with no PLACES estimate (491), and the variance inflation factors of the Model 1 and Model 2 covariate sets. Section 12 draws the article's maps and the LILA-by-aging figure (Figures 1 and 3; eFigures 3 and 5) in `output/figures_article/`, with tracts that have no CDC PLACES data left blank. Both sections read saved files and fit no model. |
 | `README.md` | This file. |
 | `LICENSE` | MIT license. |
 
 Input data are **not** redistributed here. All sources are public. The script
-downloads most of them; four sets of files must be downloaded by hand (see
+downloads most of them; three sets of files must be downloaded by hand (see
 *Manual downloads* below). Generated figures are not deposited in this
 repository. The derived output tables — the 82 CSVs backing every reported
 estimate — are archived on Zenodo at
@@ -29,7 +29,7 @@ and figures into `output/tables/` and `output/figures/`.
 
 ## Requirements
 
-- **R ≥ 4.4.** Published results were produced on R 4.6.0 (2026-04-24),
+- **R ≥ 4.4.** Reported results were produced on R 4.6.0 (2026-04-24),
   aarch64-apple-darwin23, with INLA 25.10.19.
 - Internet access — the script downloads all input data except the files listed
   under *Manual downloads*.
@@ -62,7 +62,7 @@ be skipped with
 `Rscript CKM_US_Main_public.R --skip-post`.
 
 Sections 11 and 12 run at the end of the script and take a few seconds; they print the
-seven summary values described under Contents and redraw the article figures.
+six summary values described under Contents and redraw the article figures.
 
 On the first run it downloads the input data listed above and may install missing
 packages, which takes a while. Fits in Sections 6 to 8 and the NaNDA fits are cached,
@@ -75,20 +75,19 @@ are written to `output/tables/sessionInfo.txt` at the end of the run.
 
 ## Manual downloads
 
-The script downloads most inputs itself. Save these four sets of files by hand in
+The script downloads most inputs itself. Save these three sets of files by hand in
 `data/raw/` before you run it. All are free.
 
 | Input | Where to get it | Save as | If it is missing |
 |-------|-----------------|---------|------------------|
-| EPA Downscaler PM₂.₅ and ozone, 2020, tract level | <https://www.epa.gov/hesc/rsig-related-downloadable-data-files> | `2020_pm25_daily_average_2010_census.txt.gz` and `2020_ozone_daily_8hour_maximum_2010_census.txt.gz` | The script warns and switches to AirData monitor interpolation. **The run finishes, but its results will not match the manuscript.** |
+| EPA Downscaler PM₂.₅ and ozone, 2020, tract level | <https://www.epa.gov/hesc/rsig-related-downloadable-data-files> | `2020_pm25_daily_average_2010_census.txt.gz` and `2020_ozone_daily_8hour_maximum_2010_census.txt.gz` | The script stops with a message. |
 | CDC PLACES tract file, 2022 release, GIS Friendly Format | <https://chronicdata.cdc.gov> (search for "PLACES Census Tract 2022 release (GIS Friendly Format)") | `PLACES__Census_Tract_Data_(GIS_Friendly_Format),_2022_release_20260311.csv` | The precision-weighted stages stop with a message, and so do the later stages that build on them (spline, sign-change, and regional stages). |
 | NaNDA Grocery and Food Stores, version 2.1 (eTable 5 in Supplement 1) | <https://doi.org/10.3886/ICPSR209313.V2> (free ICPSR account) | `ICPSR_209313-V2.1/nanda_grocery_Tract10_1990-2022_01.dta` | Only that stage stops, with a message. |
-| CDC/ATSDR Social Vulnerability Index 2020, U.S. census tracts, CSV | <https://www.atsdr.cdc.gov/place-health/php/svi/> | any CSV named like `SVI_2020_US.csv` | Section 8d is skipped. The manuscript does not use this check. |
 
 ## Things to know before you compare numbers
 
 **Model numbering.** *Model 1* is the behavior-**excluded** BYM2 — the total
-association, and the primary specification the manuscript interprets. *Model 2* is
+association, and the primary specification the article interprets. *Model 2* is
 the behavior-**adjusted** fit, the controlled direct effect, retained as the
 pre-specified contrast. Output files whose names contain `model2` in the
 precision-weighted stage (`09b_precision_weighted_model2*`) hold Model 1; the
@@ -98,7 +97,7 @@ code refers to fits as `_adj` / `_exc` rather than by number.
 by thousands with the INLA starting values (about 10,500 in Model 1 and about
 72,000 in Model 2), while the coefficients barely moved. The model cannot cleanly
 separate residual noise from unstructured tract variation, and those criteria
-depend on that split. The manuscript reports log marginal likelihood instead. It
+depend on that split. The article reports log marginal likelihood instead. It
 moved by up to about 7 across starting values, so smaller gaps are not interpreted
 (eTable 4 in Supplement 1). Some output tables also list DIC and WAIC; model comparison
 does not rest on them. Verify reproduction on the posterior means.
@@ -115,7 +114,7 @@ at most 2 × 10⁻⁴ (Model 1) and 8 × 10⁻³ (Model 2), the latter at the in
 The largest Model 2 difference was 0.08 SD, so a rerun can stop at that gate without
 any error in the data. Other reruns moved the means by less, and derived summaries
 can change in the third decimal, so a rerun will not match every digit of the
-deposited tables. The manuscript reports the deposited run.
+deposited tables. The article reports the deposited run.
 
 **Second starting values.** Stage 31 builds eTable 4 from `31_mlik_log.csv` (default
 start) and `31_mlik_log_second.csv` (other starts). The second file is not rebuilt by
@@ -125,12 +124,7 @@ start with no log file to rebuild eTable 4 from a new run. To refit from the sec
 starting values, set `CKM_SECOND_START=1` and run the pipeline in a separate copy of
 the project.
 
-One deposited table, `21_fara_null_check.csv`, comes from a small auxiliary
-Python check of how the Food Access Research Atlas codes missing values. The
-pipeline re-checks the same point itself (section 10, senior food-access
-stage), so that check is not needed to reproduce any reported result.
-
-## Manuscript figures
+## Article figures
 
 | Figure | File |
 |--------|------|
@@ -153,7 +147,7 @@ affects any analytic result.
 
 ## Citation
 
-If you use this code, please cite the accompanying manuscript.
+If you use this code, please cite the accompanying article.
 
 ## License
 

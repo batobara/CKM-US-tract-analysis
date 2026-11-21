@@ -19,7 +19,6 @@
 #   Walkability        EPA Smart Location DB    National Walkability Index
 #   Food access        USDA FARA 2019           low-income low-access flag
 #   Food stores        NaNDA, ICPSR (manual)    stage 30 sensitivity analysis
-#   SVI 2020           CDC/ATSDR (manual)       Section 8d check, not reported
 #
 # Run order: source this file top-to-bottom.
 # Outputs: output/figures/, output/figures_article/ (Section 12)  and  output/tables/
@@ -137,7 +136,7 @@ required_pkgs <- c(
   # Data acquisition
   "CDCPLACES",                                # CDC PLACES tract data
   "tidycensus", "tigris",                     # ACS + TIGER tract geometries
-  "nhanesA",                                  # NHANES (Paper 2 validation)
+  "nhanesA",                                  # NHANES (NHANES comparison)
   "httr2", "jsonlite", "curl",                # REST APIs + resilient downloads
   "daymetr",                                  # Daymet climate (heat)
   # Spatial core
@@ -221,7 +220,7 @@ options(tigris_use_cache = TRUE)
 # For a one-off run, export CENSUS_API_KEY in the shell environment instead.
 #
 # The key is deliberately NOT stored in this file: the script is distributed
-# with the manuscript, and a literal key here would be published with it.
+# with the article, and a literal key here would be primary with it.
 CENSUS_API_KEY <- Sys.getenv("CENSUS_API_KEY")
 if (!nzchar(CENSUS_API_KEY)) {
   stop("Census API key not found. Run once, then restart R:\n",
@@ -975,73 +974,12 @@ if (!file.exists(f_ruca)) {
   message("  cached: ", f_ruca, " (", nrow(ruca_tract), " tracts)")
 }
 
-# ---- 1e-iv. CDC/ATSDR Social Vulnerability Index (SVI) ------
-
-f_svi <- file.path(dir_proc, "01e_svi_tract.rds")
-if (!file.exists(f_svi)) {
-  svi_csvs <- list.files(dir_raw,
-    pattern = "SVI.*2020.*\\.csv$",
-    full.names = TRUE, ignore.case = TRUE)
-  if (length(svi_csvs) > 0) {
-    message("SVI 2020 CSV found: ", basename(svi_csvs[1]))
-    svi_raw <- tryCatch(
-      readr::read_csv(svi_csvs[1], show_col_types = FALSE,
-                      progress = FALSE, guess_max = 1e5),
-      error = function(e) {
-        message("  ! SVI CSV parse failed: ", e$message); NULL
-      })
-    if (!is.null(svi_raw)) {
-      svi_geo_col <- intersect(c("FIPS", "GEOID", "TRACT", "Tract", "fips"),
-                                names(svi_raw))[1]
-      svi_keep <- intersect(c("RPL_THEMES", "RPL_THEME1", "RPL_THEME2",
-                              "RPL_THEME3", "RPL_THEME4"), names(svi_raw))
-      if (!is.na(svi_geo_col) && length(svi_keep) > 0) {
-        svi_tract <- svi_raw |>
-          dplyr::select(GEOID = !!svi_geo_col,
-                        dplyr::all_of(svi_keep)) |>
-          # Pad GEOID and replace -999 sentinel with NA
-          dplyr::mutate(GEOID = stringr::str_pad(
-            as.character(GEOID), width = 11, side = "left", pad = "0")) |>
-          dplyr::mutate(dplyr::across(dplyr::all_of(svi_keep),
-            ~ ifelse(.x < 0, NA_real_, as.numeric(.x))))
-        # Rename to lowercase analytic-friendly names
-        rename_map <- c(svi_overall = "RPL_THEMES",
-                        svi_ses     = "RPL_THEME1",
-                        svi_house   = "RPL_THEME2",
-                        svi_minor   = "RPL_THEME3",
-                        svi_trans   = "RPL_THEME4")
-        rename_map <- rename_map[rename_map %in% names(svi_tract)]
-        svi_tract <- svi_tract |>
-          dplyr::rename(!!!rlang::set_names(rename_map, names(rename_map)))
-        save_tract_df(svi_tract, "01e_svi_tract")
-        message("  saved: ", f_svi, " (", nrow(svi_tract), " tracts; ",
-                length(svi_keep), " themes)")
-      } else {
-        message("  ! SVI CSV missing expected columns. Available: ",
-                paste(head(names(svi_raw), 20), collapse = ", "))
-        svi_tract <- tibble::tibble(GEOID = character(0))
-      }
-    } else {
-      svi_tract <- tibble::tibble(GEOID = character(0))
-    }
-  } else {
-    message("  ! No SVI 2020 CSV found in ", dir_raw,
-            "\n    Download from https://www.atsdr.cdc.gov/place-health/php/svi/",
-            "\n    (Census Tract → 2020 → United States → CSV) and save to data/raw/")
-    svi_tract <- tibble::tibble(GEOID = character(0))
-  }
-} else {
-  svi_tract <- readRDS(f_svi)
-  message("  cached: ", f_svi, " (", nrow(svi_tract), " tracts)")
-}
-
 # ---- 1e-v. Join SDOH layers onto analytic --------------------
 analytic <- analytic |>
   dplyr::left_join(ice_tract,  by = "GEOID") |>
   dplyr::left_join(ruca_tract |>
                      dplyr::select(GEOID, ruca_primary, ruca_class),
-                   by = "GEOID") |>
-  dplyr::left_join(svi_tract,  by = "GEOID")
+                   by = "GEOID")
 
 cat("\n--- SDOH coverage on analytic dataset ---\n")
 cat("  ICE_Race:      ",
@@ -1050,9 +988,6 @@ cat("  ICE_Income:    ",
     sum(!is.na(analytic$ice_income))," / ", nrow(analytic), "\n")
 cat("  RUCA primary:  ",
     sum(!is.na(analytic$ruca_primary))," / ", nrow(analytic), "\n")
-if ("svi_overall" %in% names(analytic))
-  cat("  SVI overall:   ",
-      sum(!is.na(analytic$svi_overall))," / ", nrow(analytic), "\n")
 
 save_tract_df(analytic, "01e_analytic_with_sdoh")
 
@@ -1075,31 +1010,6 @@ bg_to_tract <- function(df, value_cols, geoid_col = "GEOID",
 }
 
 
-safe_download <- function(url, dest, timeout_s = 600) {
-  if (file.exists(dest) && file.size(dest) > 1000) return(TRUE)
-  ok <- tryCatch({
-    curl::curl_download(url, dest, mode = "wb", quiet = FALSE,
-                        handle = curl::new_handle(timeout = timeout_s,
-                                                   followlocation = TRUE))
-    TRUE
-  }, error = function(e) {
-    message("    curl failed: ", e$message, " — falling back to wininet")
-    FALSE
-  })
-  if (!ok || !file.exists(dest) || file.size(dest) < 1000) {
-    if (file.exists(dest)) file.remove(dest)
-    ok <- tryCatch({
-      old <- options(timeout = timeout_s)
-      on.exit(options(old))
-      utils::download.file(url, dest, mode = "wb", quiet = FALSE,
-                           method = "wininet")
-      TRUE
-    }, error = function(e) {
-      message("    wininet failed: ", e$message); FALSE
-    })
-  }
-  ok && file.exists(dest) && file.size(dest) > 1000
-}
 
 
 download_first_working <- function(urls, dest, expect_ext = "zip",
@@ -1144,11 +1054,6 @@ download_first_working <- function(urls, dest, expect_ext = "zip",
   NA_character_
 }
 
-# ---- 1f-i. CDC/ATSDR SVI —
-
-svi_tract <- tibble::tibble(GEOID = character(0))
-
-
 AQ_YEAR <- 2020
 f_aq    <- file.path(dir_proc, "01f_aq_tract.rds")
 
@@ -1192,7 +1097,7 @@ if (file.exists(f_aq)) {
   }
 }
 
-# ---- 1f-ii.A. RSIG Downscaler (preferred path) ---------------
+# ---- 1f-ii.A. RSIG Downscaler ----------------------------------
 
 if (!file.exists(f_aq) && have_rsig) {
   for (p in c("data.table", "R.utils")) {     # R.utils = gzip backend for fread
@@ -1270,214 +1175,14 @@ if (!file.exists(f_aq) && have_rsig) {
           " tracts | RSIG Downscaler)")
 }
 
-# ---- 1f-ii.B. AirData IDW (fallback path) --------------------
-if (!file.exists(f_aq)) {
-  message("  !!! EPA Downscaler files not found in ", dir_raw, ".")
-  message("  !!! Falling back to AirData monitor interpolation. PM2.5 and ozone")
-  message("  !!! will differ from the manuscript, so this run will NOT reproduce")
-  message("  !!! its results. See Manual downloads in the README.")
-  message("Pulling EPA AirData annual monitor concentrations (year ",
-          AQ_YEAR, ")...")
-
-  ad_url <- sprintf(
-    "https://aqs.epa.gov/aqsweb/airdata/annual_conc_by_monitor_%d.zip",
-    AQ_YEAR)
-  ad_zip <- file.path(dir_raw, sprintf("airdata_annual_%d.zip", AQ_YEAR))
-
-  # Single small zip (~5 MB) → fast bandwidth-limited download
-  if (!file.exists(ad_zip) || file.size(ad_zip) < 1e6) {
-    message("  downloading ", ad_url)
-    ok <- safe_download(ad_url, ad_zip, timeout_s = 600)
-  } else {
-    message("  cached: ", ad_zip, " (",
-            round(file.size(ad_zip) / 1e6, 1), " MB)")
-    ok <- TRUE
-  }
-
-  aq_tract <- tibble::tibble(GEOID = character(0))
-
-  if (ok && file.exists(ad_zip) && file.size(ad_zip) > 1e6) {
-    tmpdir <- tempfile("airdata_"); dir.create(tmpdir)
-    files  <- utils::unzip(ad_zip, exdir = tmpdir)
-    csv    <- files[grepl("\\.csv$", files, ignore.case = TRUE)][1]
-
-    if (!is.na(csv)) {
-      ad <- readr::read_csv(csv, show_col_types = FALSE,
-                            progress = FALSE, guess_max = 1e5)
-      message("  AirData rows: ", nrow(ad), " | cols: ",
-              ncol(ad))
-
-      # PM2.5 (88101) annual mean — keep monitors with full-year coverage
-
-      pm25_mon <- ad |>
-        dplyr::filter(`Parameter Code` == 88101,
-                      `Sample Duration` == "24 HOUR" |
-                      `Sample Duration` == "24-HR BLK AVG",
-                      `Pollutant Standard` %in% c("PM25 Annual 2012",
-                                                   "PM25 Annual 2024") |
-                      grepl("Annual", `Pollutant Standard`),
-                      `Observation Count` >= 50,
-                      !is.na(`Arithmetic Mean`)) |>
-        dplyr::transmute(
-          monitor_id = paste(`State Code`, `County Code`,
-                             `Site Num`,    `POC`, sep = "."),
-          lon = Longitude, lat = Latitude,
-          pm25 = as.numeric(`Arithmetic Mean`)) |>
-        dplyr::group_by(monitor_id) |>
-        dplyr::summarise(lon = mean(lon), lat = mean(lat),
-                         pm25 = mean(pm25, na.rm = TRUE),
-                         .groups = "drop") |>
-        dplyr::filter(!is.na(pm25), is.finite(pm25))
-
-      # O3 (44201) — 4th-highest daily 8-hr max is reported directly
-
-      o3_mon <- ad |>
-        dplyr::filter(`Parameter Code` == 44201,
-                      grepl("8-hour", `Pollutant Standard`,
-                            ignore.case = TRUE),
-                      !is.na(`4th Max Value`)) |>
-        dplyr::transmute(
-          monitor_id = paste(`State Code`, `County Code`,
-                             `Site Num`,    `POC`, sep = "."),
-          lon = Longitude, lat = Latitude,
-          o3_4thmax = as.numeric(`4th Max Value`)) |>
-        dplyr::group_by(monitor_id) |>
-        dplyr::summarise(lon = mean(lon), lat = mean(lat),
-                         o3_4thmax = max(o3_4thmax, na.rm = TRUE),
-                         .groups = "drop") |>
-        dplyr::filter(!is.na(o3_4thmax), is.finite(o3_4thmax))
-
-      message("  PM2.5 monitors (year ", AQ_YEAR, "): ", nrow(pm25_mon))
-      message("  O3 monitors    (year ", AQ_YEAR, "): ", nrow(o3_mon))
-
-
-      if (!"gstat" %in% installed.packages()[, "Package"])
-        install.packages("gstat", repos = "https://cloud.r-project.org")
-
-
-      tract_geo_clean <- tracts_geo |>
-        dplyr::filter(!sf::st_is_empty(geometry))
-      tract_centroids <- tract_geo_clean |>
-        sf::st_transform(5070) |>          
-        sf::st_centroid(of_largest_polygon = TRUE)
-      tc_xy <- sf::st_coordinates(tract_centroids)
-      tc_df <- tibble::tibble(GEOID = tract_centroids$GEOID,
-                              x = tc_xy[, 1], y = tc_xy[, 2]) |>
-        dplyr::filter(!is.na(x), !is.na(y), is.finite(x), is.finite(y))
-      message("  tract centroids: ", nrow(tc_df), " valid (",
-              nrow(tracts_geo) - nrow(tc_df), " dropped — empty/invalid)")
-
-      project_pts <- function(df_lonlat) {
-        sf::st_as_sf(df_lonlat, coords = c("lon", "lat"), crs = 4326) |>
-          sf::st_transform(5070)
-      }
-      pm25_sf <- project_pts(pm25_mon)
-      o3_sf   <- project_pts(o3_mon)
-
-      tracts_sf <- sf::st_as_sf(tc_df, coords = c("x", "y"), crs = 5070)
-
-      krige_to_tracts <- function(monitors_sf, value_col,
-                                    nmax_krige = 50, nmax_idw = 10,
-                                    coverage_thresh = 0.9) {
-        message("  Interpolating ", value_col, " to tracts...")
-        t0  <- Sys.time()
-        fml <- stats::as.formula(paste(value_col, "~ 1"))
-
-        # ---- Step 1:ordinary kriging ----
-
-        vals <- monitors_sf[[value_col]]
-        v0   <- stats::var(vals, na.rm = TRUE)
-        v_init <- gstat::vgm(psill = 0.8 * v0, model = "Sph",
-                              range = 500000, nugget = 0.2 * v0)
-        krige_attempt <- suppressWarnings(tryCatch({
-          vgm_emp <- gstat::variogram(fml, locations = monitors_sf)
-          vgm_fit <- gstat::fit.variogram(vgm_emp, model = v_init,
-                                           fit.method = 7,
-                                           fit.ranges = TRUE,
-                                           fit.sills = TRUE)
-
-          if (any(vgm_fit$range > 5e6)) vgm_fit <- v_init
-          pred <- gstat::krige(fml, locations = monitors_sf,
-                                newdata = tracts_sf, model = vgm_fit,
-                                nmax = nmax_krige, debug.level = 0)
-          list(pred = pred$var1.pred, var = pred$var1.var,
-               vgm_emp = vgm_emp, vgm_fit = vgm_fit)
-        }, error = function(e) {
-          message("    ! Kriging error: ", e$message)
-          NULL
-        }))
-
-        # ---- Step 2: check coverage; 
-        krige_cov <- if (is.null(krige_attempt)) 0 else
-                       mean(!is.na(krige_attempt$pred))
-        method_used <- "kriging (ordinary, spherical variogram)"
-
-        if (krige_cov < coverage_thresh) {
-          message("    Kriging coverage = ",
-                  round(100 * krige_cov, 1),
-                  "% < ", round(100 * coverage_thresh), "%; falling back to IDW.")
-          idw_pred <- suppressWarnings(gstat::idw(
-            fml, locations = monitors_sf, newdata = tracts_sf,
-            nmax = nmax_idw, idp = 2, debug.level = 0))
-          method_used <- "inverse-distance weighting (k=10, p=2)"
-          out <- list(pred    = idw_pred$var1.pred,
-                      var     = rep(NA_real_, length(idw_pred$var1.pred)),
-                      vgm_emp = if (!is.null(krige_attempt))
-                                  krige_attempt$vgm_emp else NULL,
-                      vgm_fit = if (!is.null(krige_attempt))
-                                  krige_attempt$vgm_fit else NULL,
-                      method  = method_used)
-        } else {
-          out <- c(krige_attempt, list(method = method_used))
-        }
-
-        message("    method: ", method_used,
-                " | n non-NA pred = ", sum(!is.na(out$pred)),
-                " | done in ", round(difftime(Sys.time(), t0,
-                                               units = "secs"), 1), " sec")
-        out
-      }
-
-      pm25_kr <- krige_to_tracts(pm25_sf, "pm25")
-      o3_kr   <- krige_to_tracts(o3_sf,   "o3_4thmax")
-
-      # Save fitted variograms (or NULLs if IDW fallback) for manuscript Methods
-      saveRDS(list(pm25 = list(emp = pm25_kr$vgm_emp,
-                               fit = pm25_kr$vgm_fit,
-                               method = pm25_kr$method),
-                   o3   = list(emp = o3_kr$vgm_emp,
-                               fit = o3_kr$vgm_fit,
-                               method = o3_kr$method)),
-              file.path(dir_proc, "01f_aq_variograms.rds"))
-
-      aq_tract <- tibble::tibble(
-        GEOID                = tc_df$GEOID,
-        pm25_annual          = pm25_kr$pred,
-        pm25_kriging_var     = pm25_kr$var,
-        o3_8hrmax_4thmax     = o3_kr$pred,
-        o3_kriging_var       = o3_kr$var
-      )
-      attr(aq_tract, "pm25_method") <- pm25_kr$method
-      attr(aq_tract, "o3_method")   <- o3_kr$method
-      save_tract_df(aq_tract, "01f_aq_tract")
-      message("  saved: ", f_aq, " (", nrow(aq_tract), " tracts; ",
-              sum(!is.na(aq_tract$pm25_annual)), " w/ PM2.5 [",
-              pm25_kr$method, "]; ",
-              sum(!is.na(aq_tract$o3_8hrmax_4thmax)), " w/ O3 [",
-              o3_kr$method, "])")
-    } else {
-      message("  ! No CSV in AirData zip.")
-    }
-  } else {
-    message("  ! AirData download failed.\n",
-            "    Manual fallback: visit https://aqs.epa.gov/aqsweb/airdata/\n",
-            "    download annual_conc_by_monitor_", AQ_YEAR,
-            ".zip and place at:\n      ", ad_zip, "\n    then re-source.")
-  }
-} else {
-  aq_tract <- readRDS(f_aq)
-  message("  cached: ", f_aq, " (", nrow(aq_tract), " tracts)")
-}
+# ---- 1f-ii.B. Stop if the Downscaler exposure surface is missing ---------
+if (!file.exists(f_aq))
+  stop("EPA Downscaler files not found in ", dir_raw, ": ",
+       basename(RSIG_PM25_FILE), " and ", basename(RSIG_O3_FILE),
+       ". Both are required (see Manual downloads in the README).",
+       call. = FALSE)
+aq_tract <- readRDS(f_aq)
+message("  cached: ", f_aq, " (", nrow(aq_tract), " tracts)")
 
 # ---- 1f-iii. Walkability (EPA Smart Location Database V3) --------
 
@@ -1554,7 +1259,7 @@ if (!file.exists(f_walk)) {
   }, error = function(e) {
     message("  !!! SLD walkability build FAILED: ", e$message)
     message("  !!! WALKABILITY (walk_index) WILL BE MISSING/PARTIAL - this is a")
-    message("  !!! DEGRADED run and will NOT reproduce the manuscript's n=69,530")
+    message("  !!! DEGRADED run and will NOT reproduce the article's n=69,530")
     message("  !!! results. Fix the SLD download and re-run before using numbers.")
     tibble::tibble(GEOID = character(0))
   })
@@ -1646,7 +1351,7 @@ if (!file.exists(f_heat)) {
     message("  !!! PRISM heat build FAILED: ", e$message)
     message("  !!! HEAT (tmax_warm) WILL BE MISSING from this run.")
     message("  !!! This is a DEGRADED 4-exposure run and will NOT reproduce")
-    message("  !!! the manuscript's 5-exposure / n=69,530 results (heat drops")
+    message("  !!! the article's 5-exposure / n=69,530 results (heat drops")
     message("  !!! out and list-wise deletion collapses N). Fix the PRISM")
     message("  !!! download and re-run before using any numbers.")
     tibble::tibble(GEOID = character(0))
@@ -1721,25 +1426,20 @@ if (food_stale) {
 }
 
 
-ahrq_tract <- tibble::tibble(GEOID = character(0))
 
 
 env_layer_cols <- unique(c(
-  setdiff(names(svi_tract),   "GEOID"),
   setdiff(names(aq_tract),    "GEOID"),
   setdiff(names(heat_tract),  "GEOID"),
   setdiff(names(walk_tract),  "GEOID"),
-  setdiff(names(food_tract),  "GEOID"),
-  setdiff(names(ahrq_tract),  "GEOID")
+  setdiff(names(food_tract),  "GEOID")
 ))
 analytic <- analytic |>
   dplyr::select(-dplyr::any_of(env_layer_cols)) |>
-  dplyr::left_join(svi_tract,  by = "GEOID") |>
   dplyr::left_join(aq_tract,   by = "GEOID") |>
   dplyr::left_join(heat_tract, by = "GEOID") |>
   dplyr::left_join(walk_tract, by = "GEOID") |>
-  dplyr::left_join(food_tract, by = "GEOID") |>
-  dplyr::left_join(ahrq_tract, by = "GEOID")
+  dplyr::left_join(food_tract, by = "GEOID")
 
 cat("\n--- Environmental coverage on analytic dataset ---\n")
 
@@ -1783,9 +1483,9 @@ if (length(env_gate_fail) > 0L) {
     "==================================================================\n",
     " RUN HALTED — the exposure set is incomplete (degraded run).\n",
     "==================================================================\n",
-    " The manuscript uses 5 environmental exposures. The following did\n",
+    " The article uses 5 environmental exposures. The following did\n",
     " not load with full coverage, so continuing would produce a model\n",
-    " that does NOT match the manuscript:\n\n",
+    " that does NOT match the article:\n\n",
     paste0("   - ", env_gate_fail, collapse = "\n"), "\n\n",
     " Most common cause: the saved heat/walkability layers were not on\n",
     " this machine's disk, so the script tried to re-download them and\n",
@@ -1898,7 +1598,7 @@ t1_sample <- analytic |>
 if (nrow(t1_sample) != 69530L) {
   message("  !!! Table 1 sample is ", nrow(t1_sample), " tracts, not 69,530.")
   message("  !!! This is a DEGRADED run. Table 1 must not go into the ",
-          "manuscript until it reproduces 69,530.")
+          "article until it reproduces 69,530.")
 }
 
 
@@ -1922,7 +1622,7 @@ if (nrow(t1_sample) != 69530L) {
   c(list(Variable = label), as.list(vals), list(Overall = f(df)))
 }
 
-tbl1_manuscript <- dplyr::bind_rows(
+tbl1_out <- dplyr::bind_rows(
   .t1_row(t1_sample, "n (tracts)",
           function(d) format(nrow(d), big.mark = ",")),
   .t1_row(t1_sample, "% adults age 65+",
@@ -1945,8 +1645,8 @@ tbl1_manuscript <- dplyr::bind_rows(
           function(d) .t1_np(d$LILATracts_1And10))
 )
 
-cat("\n--- Manuscript Table 1: sample characteristics by RUCA stratum ---\n")
-print(as.data.frame(tbl1_manuscript))
+cat("\n--- Table 1: sample characteristics by RUCA stratum ---\n")
+print(as.data.frame(tbl1_out))
 cat("Table 1 describes the estimation sample: ",
     format(nrow(t1_sample), big.mark = ","), " tracts",
     "  (attribute-join universe: ", format(nrow(analytic), big.mark = ","),
@@ -1956,7 +1656,7 @@ cat("tracts with no RUCA class: ", sum(is.na(t1_sample$ruca_class)), "\n")
 stopifnot(sum(vapply(.t1_ruca,
                      function(k) sum(t1_sample$ruca_class == k, na.rm = TRUE),
                      integer(1))) == nrow(t1_sample))
-readr::write_csv(tbl1_manuscript,
+readr::write_csv(tbl1_out,
                  file.path(dir_tbl, "Table1_sample_characteristics.csv"))
 
 
@@ -2033,7 +1733,6 @@ nj_unavail <- tracts_geo |>
   sf::st_transform(4326) |>
   tigris::shift_geometry(geoid_column = "GEOID",
                          preserve_area = FALSE, position = "below")
-NJ_UNAVAIL_FILL <- "grey60"   
 
 cat("US analytic tracts with CKM index: ", nrow(us50),
     "\nUS tracts suppressed by PLACES:    ", nrow(us50_suppressed),
@@ -2064,79 +1763,6 @@ if (nrow(suspicious_states) > 0) {
   cat("  None — all states <5% suppression. \n")
 }
 
-# ---- 3a. Choropleth — Core CKM index -------------------------
-
-states_us <- tigris::states(cb = TRUE, year = TIGRIS_YEAR,
-                            progress_bar = FALSE) |>
-  dplyr::filter(!STATEFP %in% c("60", "66", "69", "72", "78")) |>
-  tigris::shift_geometry(preserve_area = FALSE, position = "below")
-
-states_conus <- states_us |>
-  dplyr::filter(!STATEFP %in% c("02", "15"))
-
-
-brks <- quantile(us50$ckm_core_pca, probs = seq(0, 1, 0.2), na.rm = TRUE)
-us50$ckm_q <- cut(us50$ckm_core_pca, breaks = brks,
-                  include.lowest = TRUE,
-                  labels = c("Q1 (lowest 20%)", "Q2", "Q3", "Q4",
-                             "Q5 (highest 20%)"))
-
-
-n_na_q <- sum(is.na(us50$ckm_q))
-if (n_na_q > 0) {
-  message("  ", n_na_q, " tracts got NA after cut(); dropping them.")
-  us50 <- us50 |> dplyr::filter(!is.na(ckm_q))
-}
-
-
-ckm_palette <- c("#FED976", "#FEB24C", "#FD8D3C", "#E31A1C", "#800026")
-
-
-p_choro <- ggplot() +
-  
-  geom_sf(data = us50_suppressed,
-          aes(fill = "Suppressed (no PLACES estimate)"),
-          colour = NA) +
-  
-  geom_sf(data = nj_unavail,
-          aes(fill = "Data unavailable (New Jersey)"),
-          colour = NA) +
-  
-  geom_sf(data = us50, aes(fill = ckm_q), colour = NA) +
-  geom_sf(data = states_us, fill = NA, colour = "grey25", linewidth = 0.25) +
-  scale_fill_manual(
-    values = c(setNames(ckm_palette,
-                        c("Q1 (lowest 20%)", "Q2", "Q3", "Q4", "Q5 (highest 20%)")),
-               "Suppressed (no PLACES estimate)" = "grey85",
-               "Data unavailable (New Jersey)"   = NJ_UNAVAIL_FILL),
-    name = "CKM burden",
-    breaks = c("Q5 (highest 20%)", "Q4", "Q3", "Q2", "Q1 (lowest 20%)",
-               "Suppressed (no PLACES estimate)",
-               "Data unavailable (New Jersey)"),
-    drop = FALSE,
-    na.translate = FALSE
-  ) +
-  coord_sf(datum = NA) +
-  theme_void(base_size = 11) +
-  theme(legend.position = "right",
-        plot.title = element_text(face = "bold"),
-        plot.subtitle = element_text(colour = "grey30")) +
-  labs(
-    title    = "Cardiovascular–Kidney–Metabolic risk factor burden across U.S. census tracts",
-    subtitle = paste0("Quintiles of the CKM burden index (",
-                      length(core_avail),
-                      "-component PCA: diabetes, hypertension, obesity, ",
-                      "high cholesterol, chronic kidney disease)"),
-    caption  = paste0("Data source: CDC PLACES ", PLACES_RELEASE,
-                      " (BRFSS 2019–2020). N = ",
-                      formatC(nrow(us50), big.mark = ","),
-                      " tracts.  Alaska and Hawaii repositioned for display.")
-  )
-ggsave(file.path(dir_fig, "eda_choropleth_ckm_core.png"),
-       p_choro, width = 11, height = 6.5, dpi = 220,
-       bg = "white")   
-cat("  saved: ", file.path(dir_fig, "eda_choropleth_ckm_core.png"), "\n")
-
 # ---- 3b. Spatial weights matrix 
 
 cat("\nBuilding spatial weights (k=8 nearest neighbors)...\n")
@@ -2156,242 +1782,6 @@ cat("  I = ", sprintf("%.3f", mi_core$estimate["Moran I statistic"]),
 saveRDS(list(moran_core = mi_core, lw_knn_summary = summary(nb_knn)),
         file.path(dir_proc, "03_moran_core.rds"))
 cat("  saved: ", file.path(dir_proc, "03_moran_core.rds"), "\n")
-
-# ---- 3d. Air-quality exposure choropleths 
-
-make_aq_choropleth <- function(col, palette, title, subtitle, legend_title,
-                                breaks_q = NULL, conus_only = FALSE) {
-  if (!col %in% names(analytic)) return(NULL)
-
-  fips_excl <- c("60", "66", "69", "72", "78")
-  if (conus_only) fips_excl <- c(fips_excl, "02", "15")
-
-  aq_geo <- tracts_geo |>
-    dplyr::mutate(GEOID = enc2utf8(as.character(GEOID)) |>
-                            stringr::str_trim()) |>
-    dplyr::left_join(
-      analytic |>
-        dplyr::select(GEOID, !!rlang::sym(col)) |>
-        dplyr::mutate(GEOID = enc2utf8(as.character(GEOID)) |>
-                                stringr::str_trim()),
-      by = "GEOID"
-    ) |>
-    dplyr::filter(!substr(GEOID, 1, 2) %in% fips_excl,
-                  ALAND > 0) |>
-    sf::st_transform(4326)
-  if (!conus_only)
-    aq_geo <- tigris::shift_geometry(aq_geo, geoid_column = "GEOID",
-                                       preserve_area = FALSE, position = "below")
-  aq_geo <- aq_geo |> dplyr::filter(!is.na(.data[[col]]))
-  if (nrow(aq_geo) == 0) return(NULL)
-
-
-  states_layer <- if (conus_only)
-    states_us |> dplyr::filter(!STATEFP %in% c("02", "15")) else states_us
-
-  if (is.null(breaks_q))
-    breaks_q <- quantile(aq_geo[[col]], probs = seq(0, 1, 0.2), na.rm = TRUE)
-  aq_geo$bin <- cut(aq_geo[[col]], breaks = breaks_q,
-                    include.lowest = TRUE,
-                    labels = c("Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)"))
-
-  ggplot() +
-    geom_sf(data = aq_geo, aes(fill = bin), colour = NA) +
-    geom_sf(data = states_layer, fill = NA, colour = "grey25",
-            linewidth = 0.25) +
-    scale_fill_manual(values = setNames(palette,
-                          c("Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)")),
-                       name = legend_title,
-                       breaks = c("Q5 (highest)", "Q4", "Q3", "Q2", "Q1 (lowest)"),
-                       drop = FALSE, na.translate = FALSE) +
-    coord_sf(datum = NA) +
-    theme_void(base_size = 11) +
-    theme(legend.position = "right",
-          plot.title    = element_text(face = "bold",
-                                        margin = margin(b = 4)),
-          plot.subtitle = element_text(colour = "grey30",
-                                        size = 9.5,
-                                        lineheight = 1.15,
-                                        margin = margin(b = 8))) +
-    labs(title = title, subtitle = subtitle)
-}
-
-
-.aq_method_attr <- attr(aq_tract, "method") %||% "unknown"
-.is_rsig <- grepl("rsig", .aq_method_attr)
-
-if (.is_rsig) {
-
-  .pm25_subtitle <- paste0(
-    "EPA RSIG Downscaler — fused CMAQ + monitor predictions at tract centroids\n",
-    "2020 daily means → annual mean per tract")
-  .o3_subtitle <- paste0(
-    "EPA RSIG Downscaler — fused CMAQ + monitor predictions at tract centroids\n",
-    "2020 4th-highest daily 8-hr max per tract (NAAQS form)")
-} else {
-  .aq_var <- tryCatch(
-    readRDS(file.path(dir_proc, "01f_aq_variograms.rds")),
-    error = function(e) list(pm25 = list(method = "IDW"),
-                              o3   = list(method = "IDW")))
-  .lab <- function(m) {
-    if (is.null(m)) return("IDW fallback")
-    if (grepl("^kriging", m)) "ordinary kriging" else
-    if (grepl("^inverse", m)) "inverse-distance weighting (k = 10, p = 2)" else m
-  }
-  .pm25_subtitle <- paste0("Spatial interpolation of EPA AirData annual monitor concentrations to tract centroids (",
-                            .lab(.aq_var$pm25$method), ")")
-  .o3_subtitle   <- paste0("Spatial interpolation of EPA AirData (NAAQS form) to tract centroids (",
-                            .lab(.aq_var$o3$method), ")")
-}
-
-
-p_pm25 <- make_aq_choropleth(
-  col       = "pm25_annual",
-  palette   = c("#FFFFCC", "#A1DAB4", "#41B6C4", "#2C7FB8", "#253494"),
-  title     = if (.is_rsig)
-    "Annual mean fine particulate matter (PM₂.₅) across the contiguous U.S."
-  else
-    "Annual mean fine particulate matter (PM₂.₅) across U.S. tracts",
-  subtitle     = .pm25_subtitle,
-  legend_title = "PM₂.₅ (µg/m³)\nquintile",
-  conus_only   = .is_rsig)
-if (!is.null(p_pm25)) {
-  ggsave(file.path(dir_fig, "03d_choropleth_pm25.png"),
-         p_pm25, width = 11, height = 6.5, dpi = 220, bg = "white")
-  cat("  saved: ", file.path(dir_fig, "03d_choropleth_pm25.png"), "\n")
-}
-
-p_o3 <- make_aq_choropleth(
-  col       = "o3_8hrmax_4thmax",
-  palette   = c("#FFFFCC", "#FED976", "#FD8D3C", "#E31A1C", "#800026"),
-  title     = if (.is_rsig)
-    "Annual 4th-highest 8-hour maximum ozone across the contiguous U.S."
-  else
-    "Annual 4th-highest 8-hour maximum ozone across U.S. tracts",
-  subtitle     = .o3_subtitle,
-  legend_title = "O₃ (ppm)\nquintile",
-  conus_only   = .is_rsig)
-if (!is.null(p_o3)) {
-  ggsave(file.path(dir_fig, "03d_choropleth_o3.png"),
-         p_o3, width = 11, height = 6.5, dpi = 220, bg = "white")
-  cat("  saved: ", file.path(dir_fig, "03d_choropleth_o3.png"), "\n")
-}
-
-
-p_tmax <- make_aq_choropleth(
-  col       = "tmax_warm",
-  palette   = c("#FFFFB2", "#FECC5C", "#FD8D3C", "#F03B20", "#BD0026"),
-  title     = "Warm-season maximum temperature across the contiguous U.S.",
-  subtitle  = paste0("PRISM Climate Group 4-km warm-season (May–Sep) Tmax, ",
-                     "2019–2020 mean, aggregated to census tracts"),
-  legend_title = "Tmax (°C)\nquintile",
-  conus_only   = TRUE)
-if (!is.null(p_tmax)) {
-  ggsave(file.path(dir_fig, "03d_choropleth_tmax.png"),
-         p_tmax, width = 11, height = 6.5, dpi = 220, bg = "white")
-  cat("  saved: ", file.path(dir_fig, "03d_choropleth_tmax.png"), "\n")
-}
-
-p_walk <- make_aq_choropleth(
-  col       = "walk_index",
-  palette   = c("#FFFFCC", "#C2E699", "#78C679", "#31A354", "#006837"),
-  title     = "EPA National Walkability Index across U.S. tracts",
-  subtitle  = paste0("EPA Smart Location Database v3 — block-group NatWalkInd ",
-                     "population-weighted to census tracts"),
-  legend_title = "Walkability\nquintile",
-  conus_only   = FALSE)
-if (!is.null(p_walk)) {
-  ggsave(file.path(dir_fig, "03d_choropleth_walk.png"),
-         p_walk, width = 11, height = 6.5, dpi = 220, bg = "white")
-  cat("  saved: ", file.path(dir_fig, "03d_choropleth_walk.png"), "\n")
-}
-
-
-make_sdoh_panel <- function(col, palette_dir, title_str) {
-  if (!col %in% names(analytic)) return(NULL)
-  sdoh_geo <- tracts_geo |>
-    dplyr::mutate(GEOID = enc2utf8(as.character(GEOID)) |>
-                            stringr::str_trim()) |>
-    dplyr::left_join(
-      analytic |>
-        dplyr::select(GEOID, !!rlang::sym(col)) |>
-        dplyr::mutate(GEOID = enc2utf8(as.character(GEOID)) |>
-                                stringr::str_trim()),
-      by = "GEOID"
-    ) |>
-    dplyr::filter(!substr(GEOID, 1, 2) %in% c("60", "66", "69", "72", "78"),
-                  ALAND > 0) |>
-    sf::st_transform(4326) |>
-    tigris::shift_geometry(geoid_column = "GEOID",
-                            preserve_area = FALSE, position = "below") |>
-    dplyr::filter(!is.na(.data[[col]]))
-  if (nrow(sdoh_geo) == 0) return(NULL)
-
-  if (palette_dir == "div") {
-    fill_scale <- scale_fill_gradient2(
-      low = "#2166AC", mid = "#F7F7F7", high = "#B2182B",
-      midpoint = 0, limits = c(-1, 1), oob = scales::squish,
-      name = title_str)
-  } else {
-
-    upper_clip <- if (col == "pct_age_65_plus") 40 else
-                  unname(quantile(sdoh_geo[[col]], 0.99, na.rm = TRUE))
-    fill_scale <- scale_fill_viridis_c(name = title_str, option = "C",
-                                        limits = c(0, upper_clip),
-                                        oob = scales::squish)
-  }
-  ggplot() +
-    geom_sf(data = sdoh_geo, aes(fill = .data[[col]]), colour = NA) +
-    geom_sf(data = states_us, fill = NA, colour = "grey25", linewidth = 0.2) +
-    fill_scale +
-    coord_sf(datum = NA) +
-    theme_void(base_size = 11) +
-    theme(legend.position = "bottom",
-          legend.key.width = unit(1.6, "cm"),
-          legend.key.height = unit(0.4, "cm"),
-          legend.title = element_text(size = 10),
-          legend.text  = element_text(size = 9),
-          plot.title = element_text(face = "bold", size = 12))
-}
-
-p_age   <- make_sdoh_panel("pct_age_65_plus", "seq",
-                            "% age 65+") +
-  labs(title = "(a) % adults aged ≥65")
-p_inc   <- make_sdoh_panel("ice_income", "div",
-                            "ICE Income\n(low → high)") +
-  labs(title = "(b) ICE Income")
-p_race  <- make_sdoh_panel("ice_race", "div",
-                            "ICE Race\n(NH-Black → NH-White)") +
-  labs(title = "(c) ICE Race")
-
-if (!is.null(p_age) && !is.null(p_inc) && !is.null(p_race)) {
-  p_sdoh <- (p_age | p_inc | p_race) +
-    patchwork::plot_annotation(
-      title    = "Geographic distribution of key predictors",
-      subtitle = "Three predictors selected from the BYM2 model: aging, economic concentration (ICE), and racial concentration (ICE).",
-      caption  = "ICE = Index of Concentration at the Extremes. Negative ICE = concentrated NH-Black or low-income; positive ICE = concentrated NH-White or high-income.",
-      theme    = theme(plot.caption = element_text(size = 8,
-                                                    colour = "grey40",
-                                                    hjust = 0))
-    )
-  ggsave(file.path(dir_fig, "03e_sdoh_panel.png"),
-         p_sdoh, width = 17, height = 7, dpi = 220, bg = "white")
-  cat("  saved: ", file.path(dir_fig, "03e_sdoh_panel.png"), "\n")
-}
-
-cat("\n=== Section 3 complete. ===\n",
-    "Verification checklist:\n",
-    "  [", ifelse(file.exists(file.path(dir_proc, "01_places_tract.rds")), "x", " "),
-    "] 01_places_tract.rds exists\n",
-    "  [", ifelse(file.exists(file.path(dir_proc, "02_ckm_index.rds")), "x", " "),
-    "] 02_ckm_index.rds exists\n",
-    "  [", ifelse(file.exists(file.path(dir_fig,  "eda_choropleth_ckm_core.png")), "x", " "),
-    "] eda_choropleth_ckm_core.png renders\n",
-    "  [", ifelse(mi_core$p.value < 0.001 &&
-                  mi_core$estimate["Moran I statistic"] > 0.3, "x", " "),
-    "] Moran's I > 0.3 with p < 0.001 (spatial structure confirmed)\n",
-    sep = "")
-
 
 # ==============================================================
 # 4.  NHANES VALIDATION  
@@ -2584,7 +1974,7 @@ write_csv(load_compare, file.path(dir_tbl, "04_pc1_loadings_compare.csv"))
                  OBESITY  = "Obesity",
                  HIGHCHOL = "Hypercholesterolemia",
                  KIDNEY   = "Chronic kidney disease")
-tbl2_manuscript <- load_compare |>
+tbl2_out <- load_compare |>
   dplyr::left_join(prev_compare, by = "Indicator") |>
   dplyr::transmute(
     `Condition`                = unname(.cond_label[Indicator]),
@@ -2594,9 +1984,9 @@ tbl2_manuscript <- load_compare |>
     `Prevalence, PLACES (%)`   = PLACES_pct,
     `Difference (pct. points)` = diff_pct_pts   # NHANES minus PLACES
   )
-cat("\n--- Manuscript table: PLACES vs. NHANES (merged) ---\n")
-print(tbl2_manuscript)
-write_csv(tbl2_manuscript,
+cat("\n--- Table: PLACES vs. NHANES (merged) ---\n")
+print(tbl2_out)
+write_csv(tbl2_out,
           file.path(dir_tbl, "04_table2_places_vs_nhanes.csv"))
 
 # Persist correlation matrices + validation scalars to disk (provenance)
@@ -2669,8 +2059,6 @@ cat("  Agreement with NHANES: correlation-matrix similarity r = ",
 #   Step 4: VIF-screen predictors (drop > 10), fit OLS
 #   Step 5: Diagnose residual spatial autocorrelation
 #           - Moran's I on OLS residuals
-#           - Residual choropleth
-#           - Centroid semivariogram (defer to sensitivity in Sec. 8)
 #
 # Outcome: ckm_core_pca (Stage 1+2 cardiometabolic burden, Section 2)
 # Predictors (3 blocks):
@@ -2689,11 +2077,10 @@ cat("========================================================\n")
 stale_caches <- c("05_ols_baseline.rds",
                   "06_lm_tests.rds", "06_spmoran_resf.rds",
                   "06_inla_bym2.rds", "06_inla_graph.adj",
-                  "06_6d_inla_bym2_wx.rds", "06_6g_inla_bym2_nobehav.rds",
-                  "06_5c_moran_correlogram.rds", "06_5d_residual_variogram.rds",
+                  "06_6g_inla_bym2_nobehav.rds",
                   "07_xgb_fit.rds", "07_cv_results.rds", "07_shap.rds",
-                  "08_maup_county.rds", "08_alt_weights.rds",
-                  "08_ruca_strata.rds", "08_svi_sensitivity.rds")
+                  "08_alt_weights.rds",
+                  "08_ruca_strata.rds")
 .f_inputs <- file.path(dir_proc,
                        c("01f_aq_tract.rds",   "01f_heat_warm_tract.rds",
                          "01f_walk_tract.rds", "01f_food_tract.rds"))
@@ -2728,10 +2115,7 @@ extra_cols <- c("ice_race", "ice_income", "ruca_class",
                 # PLACES behavioral / access
                 "CSMOKING", "LPA", "ACCESS2",
                 # PLACES healthcare-engagement
-                "CHECKUP",
-                # CDC/ATSDR SVI 2020
-                "svi_overall", "svi_ses", "svi_house",
-                "svi_minor", "svi_trans")
+                "CHECKUP")
 extra_cols <- intersect(extra_cols, names(analytic))
 
 mod_data <- conus |>
@@ -2823,53 +2207,6 @@ if (mi_resid$estimate["Moran I statistic"] > 0.1 && mi_resid$p.value < 0.001) {
   cat("\n  Residuals appear spatially independent — OLS may be adequate.\n")
 }
 
-# ---- 5d. Residual choropleth   --------
-
-resid_geo <- conus |>
-  dplyr::inner_join(
-    mod_data |> dplyr::select(GEOID, ols_resid),
-    by = "GEOID"
-  ) |>
-  sf::st_transform(4326) |>
-  tigris::shift_geometry(geoid_column = "GEOID",
-                         preserve_area = FALSE,
-                         position = "below")
-
-# Diverging palette centered at 0 (red = under-predicted, blue = over-predicted)
-resid_lim <- max(abs(quantile(resid_geo$ols_resid,
-                              probs = c(0.02, 0.98), na.rm = TRUE)))
-
-p_resid <- ggplot() +
-  geom_sf(data = resid_geo, aes(fill = ols_resid), colour = NA) +
-  # NJ — not modeled (no Core index; PLACES lacks BPHIGH & HIGHCHOL)
-  geom_sf(data = nj_unavail, fill = NJ_UNAVAIL_FILL, colour = NA) +
-  geom_sf(data = states_conus, fill = NA, colour = "grey25", linewidth = 0.25) +
-  scale_fill_gradient2(
-    low = "#2166AC", mid = "white", high = "#B2182B",
-    midpoint = 0,
-    limits = c(-resid_lim, resid_lim),
-    oob    = scales::squish,
-    name   = "Residual\n(PC1 score units)"
-  ) +
-  coord_sf(datum = NA) +
-  theme_void(base_size = 11) +
-  theme(legend.position = "right",
-        plot.title = element_text(face = "bold"),
-        plot.subtitle = element_text(colour = "grey30")) +
-  labs(
-    title    = "Spatial pattern of unexplained CKM burden",
-    subtitle = paste0("OLS residuals after adjustment for SDOH + demographics. ",
-                      "Red = under-prediction (excess CKM); blue = over-prediction. "),
-    caption  = paste0("Moran's I = ",
-                      sprintf("%.3f", mi_resid$estimate["Moran I statistic"]),
-                      ", p < .001",
-                      " New Jersey (grey) lacks PLACES Core-indicator data and",
-                      " is not modeled.")
-  )
-ggsave(file.path(dir_fig, "05_ols_residuals_map.png"),
-       p_resid, width = 11, height = 6.5, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "05_ols_residuals_map.png"), "\n")
-
 # ---- 5e. Normality diagnostics  -------
 
 cat("\n--- (5e) Outcome + OLS residual normality diagnostics ---\n")
@@ -2904,54 +2241,6 @@ print(norm_diag)
 readr::write_csv(norm_diag,
                  file.path(dir_tbl, "05e_normality_diagnostics.csv"))
 
-# Supplementary figure: outcome distribution
-p_hist <- ggplot(data.frame(x = mod_data$ckm_core_pca),
-                 aes(x = x)) +
-  geom_histogram(aes(y = after_stat(density)),
-                 bins = 60, fill = "#FED976", colour = "white",
-                 linewidth = 0.2) +
-  geom_density(colour = "#B2182B", linewidth = 0.8) +
-  stat_function(fun = dnorm,
-                args = list(mean = mean(mod_data$ckm_core_pca, na.rm = TRUE),
-                            sd   = sd(mod_data$ckm_core_pca,   na.rm = TRUE)),
-                colour = "#2166AC", linetype = "dashed", linewidth = 0.7) +
-  labs(
-    x = "CKM burden index (PCA score units)",
-    y = "Density",
-    title    = "Outcome distribution — CKM burden index",
-    subtitle = sprintf("Skewness = %.2f, excess kurtosis = %.2f, n = %s tracts. ",
-                       .skew(mod_data$ckm_core_pca),
-                       .kurt_excess(mod_data$ckm_core_pca),
-                       formatC(sum(!is.na(mod_data$ckm_core_pca)),
-                                big.mark = ",")),
-    caption  = "Red curve = empirical density; blue dashed = best-fit normal."
-  ) +
-  theme_ckm
-ggsave(file.path(dir_fig, "S9_outcome_normality.png"),
-       p_hist, width = 8, height = 5, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "S9_outcome_normality.png"), "\n")
-
-# Supplementary figure: Q-Q plot of OLS residuals
-p_qq <- ggplot(data.frame(r = mod_data$ols_resid),
-               aes(sample = r)) +
-  stat_qq(alpha = 0.15, colour = "#2166AC", size = 0.4) +
-  stat_qq_line(colour = "#B2182B", linewidth = 0.7) +
-  labs(
-    x = "Theoretical quantiles (standard normal)",
-    y = "Sample quantiles (OLS residuals)",
-    title    = "Q–Q plot of OLS residuals vs. standard normal",
-    subtitle = sprintf("Skewness = %.2f, excess kurtosis = %.2f, n = %s tracts.",
-                       .skew(mod_data$ols_resid),
-                       .kurt_excess(mod_data$ols_resid),
-                       formatC(sum(!is.na(mod_data$ols_resid)),
-                                big.mark = ",")),
-    caption  = "Red line = identity (perfect normality). Curvature in tails ⇒ heavy/light tails."
-  ) +
-  theme_ckm
-ggsave(file.path(dir_fig, "S10_ols_residual_qq.png"),
-       p_qq, width = 7, height = 6, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "S10_ols_residual_qq.png"), "\n")
-
 cat("\n=== Section 5 complete. ===\n")
 cat("  OLS R²: ", round(ols_summary$r.squared, 3),
     " | Residual Moran's I: ", round(mi_resid$estimate["Moran I statistic"], 3),
@@ -2959,7 +2248,7 @@ cat("  OLS R²: ", round(ols_summary$r.squared, 3),
 
 
 # ==============================================================
-# 6.  SPATIAL REGRESSION  (INLA BYM2 + LM tests + spatial-lag covariates)
+# 6.  SPATIAL REGRESSION  (INLA BYM2 + LM tests)
 # ==============================================================
 # Step 6 (model-form selection): LM-err vs. LM-lag, robust variants.
 # Step 7 (fit spatial model + interpret).
@@ -3090,7 +2379,7 @@ if (length(env_predictors) == 0 &&
   }
 }
 
-# Aging × env interactions (paper's hypothesis)
+# Aging × env interactions
 aging_env_terms <- if (length(env_predictors) > 0)
   paste0("pct_age_65_plus:", env_predictors) else character(0)
 
@@ -3232,7 +2521,7 @@ cat("  Residual Moran's I (after ESF): ",
 cat("\n  Coefficients (top of table):\n")
 print(round(resf_fit$b[1:min(15, nrow(resf_fit$b)), ], 4))
 
-# Save coefficient table for the manuscript
+# Save coefficient table for the article
 coef_esf <- tibble::as_tibble(resf_fit$b, rownames = "predictor")
 readr::write_csv(coef_esf, file.path(dir_tbl, "06_coefficients_esf.csv"))
 
@@ -3258,14 +2547,13 @@ warn_incomplete_bym2 <- function(x, path, label) {
   message("     ", basename(path))
   message("     missing: ", paste(miss, collapse = ", "))
   message("     Nothing here is broken: this script's own outputs never read")
-  message("     these fields, and 13_residual_effect_map.R needs only")
-  message("     summary_random, which IS present. The one consumer of the")
+  message("     these fields. The one consumer of the")
   message("     missing fields, 12_bym2_posterior_residual.R, does not read")
   message("     this cache for them -- it refits both models itself and")
   message("     writes its own 12_bym2_refit_model*.rds.")
   message("     Do NOT delete this file to 'upgrade' it. A refit reproduces")
   message("     every posterior mean closely (README, 'Refit drift'), but deleting")
-  message("     it would discard the fit the manuscript reports.")
+  message("     it would discard the fit the article reports.")
   invisible(FALSE)
 }
 
@@ -3393,721 +2681,9 @@ readr::write_csv(cmp, file.path(dir_tbl, "06_coefficient_comparison.csv"))
 cat("\n  Coefficient-comparison table saved: ",
     file.path(dir_tbl, "06_coefficient_comparison.csv"), "\n")
 
-# ---- 6g. Residual Moran's I progression ------------------------
-# Visualize how spatial models reduce residual autocorrelation.
-ols_obj_cached <- readRDS(file.path(dir_proc, "05_ols_baseline.rds"))
-mi_ols <- spdep::moran.test(residuals(ols_obj_cached$model), lw_mod,
-                            zero.policy = TRUE, randomisation = TRUE)
-mi_progression <- tibble::tibble(
-  model   = c("OLS baseline (S5)", "spmoran ESF (6d)"),
-  moran_I = c(unname(mi_ols$estimate[1]), unname(mi_esf$estimate[1])),
-  p_value = c(mi_ols$p.value,             mi_esf$p.value)
-)
-print(mi_progression)
-readr::write_csv(mi_progression,
-                 file.path(dir_tbl, "06_residual_moran_progression.csv"))
-
-# ---- 6h. BYM2 spatial random-effect map -----------------------
-
-if (have_inla && file.exists(f_bym2) &&
-    !is.null(bym2_save$summary_random)) {
-  message("Building BYM2 spatial random-effect map...")
-
-  re_df <- tibble::as_tibble(bym2_save$summary_random)
-  if (!"idarea" %in% names(re_df) && "ID" %in% names(re_df))
-    names(re_df)[match("ID", names(re_df))] <- "idarea"
-  n_tracts_bym2 <- nrow(mod_geo)
-  re_df <- head(re_df, n_tracts_bym2)
-  re_df$GEOID <- mod_geo$GEOID
-
-  re_geo <- tracts_geo |>
-    dplyr::mutate(GEOID = enc2utf8(as.character(GEOID)) |>
-                            stringr::str_trim()) |>
-    dplyr::inner_join(
-      re_df |> dplyr::select(GEOID, mean) |>
-        dplyr::mutate(GEOID = enc2utf8(as.character(GEOID)) |>
-                                stringr::str_trim()),
-      by = "GEOID") |>
-    dplyr::filter(!substr(GEOID, 1, 2) %in% c("60", "66", "69", "72", "78"),
-                  ALAND > 0) |>
-    sf::st_transform(4326) |>
-    tigris::shift_geometry(geoid_column = "GEOID",
-                            preserve_area = FALSE, position = "below")
-
-  re_lim <- max(abs(quantile(re_geo$mean, c(0.02, 0.98), na.rm = TRUE)))
-
-  p_bym2_map <- ggplot() +
-    geom_sf(data = re_geo, aes(fill = mean), colour = NA) +
-
-    geom_sf(data = nj_unavail, fill = NJ_UNAVAIL_FILL, colour = NA) +
-    geom_sf(data = states_conus, fill = NA, colour = "grey25", linewidth = 0.25) +
-    scale_fill_gradient2(
-      low = "#2166AC", mid = "white", high = "#B2182B",
-      midpoint = 0,
-      limits = c(-re_lim, re_lim), oob = scales::squish,
-      name = "Spatial\nrandom effect\n(PC1 score units)") +
-    coord_sf(datum = NA) +
-    theme_void(base_size = 11) +
-    theme(legend.position = "right",
-          plot.title    = element_text(face = "bold"),
-          plot.subtitle = element_text(colour = "grey30")) +
-    labs(
-      title    = "Unexplained spatial structure in CKM burden after full adjustment",
-      subtitle = paste0("BYM2 spatial random effect after adjusting for ",
-                        "demographic, SDOH, behavioral, healthcare-engagement, ",
-                        "and environmental predictors. ",
-                        "Red = excess burden beyond what predictors explain."),
-      caption  = paste0("Hierarchical Bayesian INLA BYM2 model. ",
-                        "Persistent red clusters reveal regions where additional ",
-                        "unmeasured factors drive CKM burden. ",
-                        "New Jersey (grey) lacks PLACES Core-indicator data and ",
-                        "is not modeled.")
-    )
-  ggsave(file.path(dir_fig, "06h_bym2_spatial_random_effect.png"),
-         p_bym2_map, width = 11, height = 6.5, dpi = 220, bg = "white")
-  cat("  saved: ", file.path(dir_fig, "06h_bym2_spatial_random_effect.png"),
-      "\n")
-}
-
 cat("\n=== Section 6 complete. ===\n")
 cat("  LM-test verdict: ", form_pick, "\n", sep = "")
-cat("  Residual I: OLS=", sprintf("%.3f", mi_progression$moran_I[1]),
-    " → ESF=", sprintf("%.3f", mi_progression$moran_I[2]), "\n", sep = "")
-cat("  Next: spatial diagnostics (Section 6.5) → machine-learning model (Section 7)\n")
-
-
-# ==============================================================
-# 6.5  CANONICAL DIAGNOSTICS  (LISA, Gi*, correlogram, variogram, AIC)
-# ==============================================================
-#  diagnostics that the
-# OLS → ESF → BYM2 progression doesn't produce by default.
-#
-#   6.5a  Local Moran's I (LISA) cluster map         → supplementary figure
-#   6.5b  Getis-Ord Gi* hotspot map                  → supplementary figure
-#   6.5c  Moran's I correlogram (autocorr by lag)    → supplementary figure
-#   6.5d  Residual semivariogram on tract centroids  → supplementary figure
-#   6.5e  AIC / DIC / WAIC comparison table          → methods-comparison table
-
-cat("\n========================================================\n")
-cat("Section 6.5: Spatial diagnostics\n")
-cat("========================================================\n")
-
-# ---- 6.5a. Local Moran's I (LISA) ----------------------------
-
-f_lisa <- file.path(dir_proc, "06_5a_lisa.rds")
-if (!file.exists(f_lisa)) {
-  message("Computing Local Moran's I (LISA) on CKM Core index...")
-  lisa_vals <- spdep::localmoran(conus$ckm_core_pca, lw_knn,
-                                 zero.policy = TRUE)
-  pcol <- intersect(c("Pr(z != E(Ii))", "Pr(z > 0)", "Pr(z < 0)"),
-                    colnames(lisa_vals))[1]
-  if (is.na(pcol)) pcol <- grep("^Pr", colnames(lisa_vals), value = TRUE)[1]
-
-  # Spatial-lag standardized x for HH/LL/HL/LH classification
-  x_std  <- as.numeric(scale(conus$ckm_core_pca))
-  wx_std <- spdep::lag.listw(lw_knn, x_std, zero.policy = TRUE)
-
-  lisa_df <- tibble::tibble(
-    GEOID   = conus$GEOID,
-    Ii      = lisa_vals[, "Ii"],
-    p       = lisa_vals[, pcol],
-    z       = lisa_vals[, "Z.Ii"],
-    cluster = dplyr::case_when(
-      is.na(lisa_vals[, pcol]) | lisa_vals[, pcol] >= 0.05 ~ "Not significant",
-      x_std > 0  & wx_std > 0  ~ "HH (high-high)",
-      x_std < 0  & wx_std < 0  ~ "LL (low-low)",
-      x_std > 0  & wx_std < 0  ~ "HL (high-low outlier)",
-      x_std < 0  & wx_std > 0  ~ "LH (low-high outlier)",
-      TRUE                     ~ "Not significant"
-    )
-  )
-  saveRDS(lisa_df, f_lisa)
-  message("  saved: ", f_lisa)
-} else {
-  lisa_df <- readRDS(f_lisa)
-  message("  cached: ", f_lisa)
-}
-
-cat("\n--- LISA classification (CKM Core, k=8 W) ---\n")
-print(table(lisa_df$cluster, useNA = "ifany"))
-
-lisa_geo <- conus |>
-  dplyr::inner_join(lisa_df, by = "GEOID") |>
-  sf::st_transform(4326) |>
-  tigris::shift_geometry(geoid_column = "GEOID",
-                         preserve_area = FALSE,
-                         position = "below")
-
-p_lisa <- ggplot() +
-  geom_sf(data = lisa_geo, aes(fill = cluster), colour = NA) +
-
-  geom_sf(data = nj_unavail, aes(fill = "Data unavailable (New Jersey)"),
-          colour = NA) +
-  geom_sf(data = states_conus, fill = NA, colour = "grey25", linewidth = 0.25) +
-  scale_fill_manual(
-    values = c("HH (high-high)"        = "#B2182B",
-               "LL (low-low)"          = "#2166AC",
-               "HL (high-low outlier)" = "#F4A582",
-               "LH (low-high outlier)" = "#92C5DE",
-               "Not significant"       = "grey90",
-               "Data unavailable (New Jersey)" = NJ_UNAVAIL_FILL),
-    name = "LISA cluster",
-    breaks = c("HH (high-high)", "LL (low-low)",
-               "HL (high-low outlier)", "LH (low-high outlier)",
-               "Not significant", "Data unavailable (New Jersey)"),
-    drop = FALSE) +
-  coord_sf(datum = NA) +
-  theme_void(base_size = 11) +
-  theme(legend.position = "right",
-        plot.title = element_text(face = "bold"),
-        plot.subtitle = element_text(colour = "grey30")) +
-  labs(
-    title    = "Local Moran's I (LISA) cluster map of CKM burden",
-    subtitle = "Significant local autocorrelation patterns (p < .05). LISA identifies local autocorrelation, not statistically confirmed disease clusters.",
-    caption  = paste0("HH = high-burden tract surrounded by high-burden neighbors; LL = low-low; HL/LH = spatial outliers. ",
-                      "k = 8 nearest-neighbor weights, n = ",
-                      formatC(nrow(lisa_geo), big.mark = ","),
-                      " CONUS tracts.")
-  )
-ggsave(file.path(dir_fig, "06_5a_lisa_cluster_map.png"),
-       p_lisa, width = 11, height = 6.5, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "06_5a_lisa_cluster_map.png"), "\n")
-
-# ---- 6.5b. Getis-Ord Gi* hotspot statistic --------------------
-
-f_gi <- file.path(dir_proc, "06_5b_getis_ord.rds")
-if (!file.exists(f_gi)) {
-  message("Computing Getis-Ord Gi* hotspot statistic...")
-  lw_self <- spdep::nb2listw(spdep::include.self(nb_knn),
-                             style = "W", zero.policy = TRUE)
-  gi_vals <- spdep::localG(conus$ckm_core_pca, lw_self,
-                            zero.policy = TRUE)
-  gi_df <- tibble::tibble(GEOID   = conus$GEOID,
-                          Gi_star = as.numeric(gi_vals))
-  saveRDS(gi_df, f_gi)
-  message("  saved: ", f_gi)
-} else {
-  gi_df <- readRDS(f_gi)
-  message("  cached: ", f_gi)
-}
-cat("\n--- Getis-Ord Gi* z-score range ---\n")
-cat("  [", sprintf("%.2f", min(gi_df$Gi_star, na.rm = TRUE)),
-    ", ", sprintf("%.2f", max(gi_df$Gi_star, na.rm = TRUE)), "]",
-    "  (|z|>2.58 ⇒ p<0.01)\n", sep = "")
-cat("  Hot spots (z > 2.58):  ", sum(gi_df$Gi_star >  2.58, na.rm = TRUE), "\n")
-cat("  Cold spots (z <-2.58): ", sum(gi_df$Gi_star < -2.58, na.rm = TRUE), "\n")
-
-gi_geo <- conus |>
-  dplyr::inner_join(gi_df, by = "GEOID") |>
-  sf::st_transform(4326) |>
-  tigris::shift_geometry(geoid_column = "GEOID",
-                         preserve_area = FALSE,
-                         position = "below")
-
-p_gi <- ggplot() +
-  geom_sf(data = gi_geo, aes(fill = Gi_star), colour = NA) +
-  # NJ — not analyzed (no Core index; PLACES lacks BPHIGH & HIGHCHOL)
-  geom_sf(data = nj_unavail, fill = NJ_UNAVAIL_FILL, colour = NA) +
-  geom_sf(data = states_conus, fill = NA, colour = "grey25", linewidth = 0.25) +
-  scale_fill_gradient2(
-    low = "#2166AC", mid = "white", high = "#B2182B",
-    midpoint = 0, limits = c(-6, 6), oob = scales::squish,
-    name = "Gi* z-score") +
-  coord_sf(datum = NA) +
-  theme_void(base_size = 11) +
-  theme(legend.position = "right",
-        plot.title    = element_text(face = "bold"),
-        plot.subtitle = element_text(colour = "grey30")) +
-  labs(
-    title    = "Getis-Ord Gi* hotspot map of CKM burden",
-    subtitle = "Red = significant burden hotspots (z > 0); blue = cold spots (z < 0).",
-    caption  = paste0("Gi* with self in neighbor set, k = 8, n = ",
-                      formatC(nrow(gi_geo), big.mark = ","),
-                      " CONUS tracts. New Jersey (grey) lacks PLACES ",
-                      "Core-indicator data and is not analyzed.")
-  )
-ggsave(file.path(dir_fig, "06_5b_getis_ord_gi.png"),
-       p_gi, width = 11, height = 6.5, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "06_5b_getis_ord_gi.png"), "\n")
-
-# ---- 6.5c. Moran's I correlogram ------------------------------
-
-f_correl <- file.path(dir_proc, "06_5c_moran_correlogram.rds")
-if (!file.exists(f_correl)) {
-  message("Computing Moran's I correlogram on 5,000-tract subsample...")
-  set.seed(20260426)
-  sub_idx    <- sample(seq_len(nrow(conus)), min(5000, nrow(conus)))
-  conus_sub  <- conus[sub_idx, ]
-  coords_sub <- conus_sub |>
-    sf::st_centroid(of_largest_polygon = TRUE) |>
-    sf::st_coordinates()
-  nb_sub <- spdep::knn2nb(spdep::knearneigh(coords_sub, k = 8), sym = TRUE)
-
-  correl_res <- spdep::sp.correlogram(
-    nb_sub, conus_sub$ckm_core_pca,
-    order = 6, method = "I",
-    style = "W", zero.policy = TRUE)
-  saveRDS(correl_res, f_correl)
-  message("  saved: ", f_correl)
-} else {
-  correl_res <- readRDS(f_correl)
-  message("  cached: ", f_correl)
-}
-
-cat("\n--- Moran's I correlogram (lag orders 1-6) ---\n")
-correl_I <- correl_res$res[, 1]
-correl_df <- tibble::tibble(lag = seq_along(correl_I), I = correl_I)
-print(round(correl_df, 3))
-
-p_correl <- ggplot(correl_df, aes(x = lag, y = I)) +
-  geom_hline(yintercept = 0, colour = "grey50", linetype = "dashed") +
-  geom_line(colour = "#FD8D3C", linewidth = 1) +
-  geom_point(size = 3, colour = "#FD8D3C") +
-  geom_text(aes(label = sprintf("%.3f", I)), vjust = -0.8, size = 3.2) +
-  scale_x_continuous(breaks = correl_df$lag) +
-  labs(
-    x = "Spatial lag order (neighbors of neighbors of …)",
-    y = "Moran's I",
-    title    = "Moran's I correlogram — autocorrelation decays with lag order",
-    subtitle = "5,000-tract random subsample, k = 8 nearest-neighbor weights"
-  ) +
-  theme_ckm
-ggsave(file.path(dir_fig, "06_5c_moran_correlogram.png"),
-       p_correl, width = 8, height = 5, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "06_5c_moran_correlogram.png"), "\n")
-
-# ---- 6.5d. Residual semivariogram on tract centroids -----------
-
-f_var <- file.path(dir_proc, "06_5d_residual_variogram.rds")
-if (!file.exists(f_var)) {
-  message("Computing residual semivariogram on OLS residuals...")
-  if (!"gstat" %in% installed.packages()[, "Package"])
-    install.packages("gstat", repos = "https://cloud.r-project.org")
-
-  # Use mod_geo + mod_data2 OLS residuals (already computed in §5)
-  variog_input <- mod_data2 |>
-    dplyr::transmute(GEOID, ols_resid = residuals(ols_full2)) |>
-    dplyr::inner_join(
-      mod_geo |> dplyr::select(GEOID),
-      by = "GEOID"
-    )
-  variog_sf <- mod_geo |>
-    dplyr::filter(GEOID %in% variog_input$GEOID) |>
-    dplyr::left_join(variog_input, by = "GEOID") |>
-    sf::st_centroid(of_largest_polygon = TRUE) |>
-    dplyr::filter(!is.na(ols_resid))
-
-  # Sample for tractability (full variogram on 50k+ centroids is heavy)
-  set.seed(20260426)
-  variog_sub <- variog_sf[sample(seq_len(nrow(variog_sf)),
-                                  min(5000, nrow(variog_sf))), ]
-  variog_emp <- gstat::variogram(ols_resid ~ 1, variog_sub,
-                                  cutoff = 1500000,    # 1500 km
-                                  width  = 50000)      # 50 km bins
-  saveRDS(variog_emp, f_var)
-  message("  saved: ", f_var)
-} else {
-  variog_emp <- readRDS(f_var)
-  message("  cached: ", f_var)
-}
-cat("\n--- Residual semivariogram (OLS residuals) ---\n")
-cat("  bins: ", nrow(variog_emp), " | distance range: 0-",
-    round(max(variog_emp$dist) / 1000), " km\n", sep = "")
-
-p_var <- ggplot(variog_emp, aes(x = dist / 1000, y = gamma)) +
-  geom_point(aes(size = np / 1000), alpha = 0.7, colour = "#2166AC") +
-  geom_line(colour = "#2166AC", linewidth = 0.5) +
-  scale_size_continuous(name = "Pairs\n(thousands)",
-                        trans  = "sqrt",
-                        range  = c(1.5, 5),
-                        breaks = c(50, 150, 250)) +
-  labs(
-    x = "Distance between tract centroids (km)",
-    y = expression("Semivariance " * gamma * "(h)"),
-    title    = "Residual semivariogram on OLS residuals (tract centroids)",
-    subtitle = paste0("Geostatistical diagnostic on tract centroids. ",
-                       "5,000-tract subsample.")
-  ) +
-  theme_ckm
-ggsave(file.path(dir_fig, "06_5d_residual_semivariogram.png"),
-       p_var, width = 8, height = 5, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "06_5d_residual_semivariogram.png"), "\n")
-
-# ---- 6.5e. AIC / DIC / WAIC fit-comparison table --------------
-
-cat("\n--- Model fit comparison: OLS / ESF / BYM2 ---\n")
-
-ols_obj_fit  <- readRDS(file.path(dir_proc, "05_ols_baseline.rds"))
-esf_obj_fit  <- readRDS(file.path(dir_proc, "06_spmoran_resf.rds"))
-bym2_obj_fit <- readRDS(file.path(dir_proc, "06_inla_bym2.rds"))
-
-# OLS AIC — both the simple and the full (post-env) OLS
-aic_ols_simple <- AIC(ols_obj_fit$model)
-aic_ols_full   <- AIC(ols_full2)
-
-# ESF: spmoran reports an information criterion in fit$e if available
-aic_esf <- tryCatch({
-  esf_e <- esf_obj_fit$fit$e
-  ic_nm <- intersect(c("AIC", "aic", "BIC", "bic"), names(esf_e))[1]
-  if (!is.na(ic_nm)) as.numeric(esf_e[[ic_nm]]) else NA_real_
-}, error = function(e) NA_real_)
-
-# BYM2: DIC and WAIC stored in cached object
-dic_bym2  <- bym2_obj_fit$dic
-waic_bym2 <- bym2_obj_fit$waic
-
-fit_compare <- tibble::tibble(
-  model      = c("OLS baseline (§5)",
-                  "OLS full (post-env, §6 fml)",
-                  "spmoran ESF (§6d)",
-                  "INLA BYM2 (§6e)"),
-  n          = c(ols_obj_fit$n,
-                  nrow(mod_data2),
-                  esf_obj_fit$n %||% NA_real_,
-                  bym2_obj_fit$n),
-  AIC        = c(round(aic_ols_simple, 1),
-                  round(aic_ols_full, 1),
-                  if (is.na(aic_esf)) NA else round(aic_esf, 1),
-                  NA),
-  DIC        = c(NA, NA, NA, round(dic_bym2, 1)),
-  WAIC       = c(NA, NA, NA, round(waic_bym2, 1)),
-  p_eff_dic  = c(NA, NA, NA,
-                 round(bym2_obj_fit$p_eff_dic  %||% NA_real_, 1)),
-  p_eff_waic = c(NA, NA, NA,
-                 round(bym2_obj_fit$p_eff_waic %||% NA_real_, 1))
-)
-if (is.na(fit_compare$p_eff_dic[4]))
-  message("  NOTE: p.eff absent from the cached Model 2 fit. ",
-          "Delete the BYM2 cache and refit to populate it.")
-print(fit_compare)
-readr::write_csv(fit_compare, file.path(dir_tbl, "06_5e_fit_comparison.csv"))
-cat("  saved: ", file.path(dir_tbl, "06_5e_fit_comparison.csv"), "\n")
-
-cat("\n=== Section 6.5 complete. ===\n")
-cat("  Additional diagnostics:\n")
-cat("    LISA cluster map         → 06_5a_lisa_cluster_map.png\n")
-cat("    Getis-Ord Gi* hotspot    → 06_5b_getis_ord_gi.png\n")
-cat("    Moran's I correlogram    → 06_5c_moran_correlogram.png\n")
-cat("    Residual semivariogram   → 06_5d_residual_semivariogram.png\n")
-cat("    Fit-comparison table     → 06_5e_fit_comparison.csv\n")
-
-
-# ==============================================================
-# 6.6  Wx FOCAL-VS-NEIGHBORHOOD-EFFECTS DECOMPOSITION
-# ==============================================================
-
-
-
-cat("\n========================================================\n")
-cat("Section 6.6 — Wx (focal-vs-neighborhood) decomposition\n")
-cat("========================================================\n")
-
-# ---- 6.6a. Choose focal predictors for Wx augmentation --------
-
-WX_PREDICTORS <- intersect(
-  c("pct_age_65_plus", "ice_income", "ice_race",
-    "pct_bachelor_plus", "pct_hispanic",
-    "pm25_annual", "o3_8hrmax_4thmax", "tmax_warm", "walk_index"),
-  names(mod_data2)
-)
-cat("Wx predictors (", length(WX_PREDICTORS), "): ",
-    paste(WX_PREDICTORS, collapse = ", "), "\n", sep = "")
-
-# ---- 6.6b. Compute Wx terms on the WIDER analytic universe ----
-
-wx_input <- conus |>
-  sf::st_drop_geometry() |>
-  dplyr::select(GEOID) |>
-  dplyr::mutate(GEOID = as.character(GEOID)) |>
-  dplyr::left_join(
-    analytic |>
-      dplyr::select(GEOID, dplyr::any_of(WX_PREDICTORS)) |>
-      dplyr::mutate(GEOID = as.character(GEOID)) |>
-      dplyr::mutate(dplyr::across(dplyr::any_of(WX_PREDICTORS),
-                                   ~ suppressWarnings(as.numeric(.x)))),
-    by = "GEOID"
-  )
-wx_input_idx <- seq_len(nrow(wx_input))   # left_join preserves conus order
-
-
-if ("o3_8hrmax_4thmax" %in% names(wx_input))
-  wx_input$o3_8hrmax_4thmax <- wx_input$o3_8hrmax_4thmax * 100
-
-cat("  Computing Wx on wider universe (n = ", nrow(wx_input),
-    " CONUS tracts) ...\n", sep = "")
-
-for (pred in WX_PREDICTORS) {
-  if (!pred %in% names(wx_input)) {
-    cat("    ! ", pred, " not in wx_input; skipping\n")
-    next
-  }
-  x_vec <- wx_input[[pred]][wx_input_idx]   # align to lw_knn order (= conus)
-
-  # (1) Zero-fill NAs for the numerator
-  x_zeroed <- x_vec
-  x_zeroed[is.na(x_zeroed)] <- 0
-
-  # (2) Indicator for "neighbor has a non-NA value"
-  na_indicator <- as.numeric(!is.na(x_vec))
-
-  # (3) Multiply both through W (no NAs now → no NA propagation)
-  wx_numer <- spdep::lag.listw(lw_knn, x_zeroed,     zero.policy = TRUE)
-  wx_wt    <- spdep::lag.listw(lw_knn, na_indicator, zero.policy = TRUE)
-
-  # (4) Renormalize: average over non-NA neighbors
-  wx_wt[wx_wt == 0] <- NA_real_   # avoid div-by-zero (zero non-NA neighbors)
-  wx_vec <- wx_numer / wx_wt
-
-  wx_input[[paste0("wx_", pred)]] <-
-    wx_vec[match(wx_input$GEOID, conus$GEOID)]
-}
-
-mod_data2 <- mod_data2 |> dplyr::select(-dplyr::any_of(starts_with("wx_")))
-wx_join <- wx_input |>
-  dplyr::select(GEOID, dplyr::starts_with("wx_")) |>
-  dplyr::mutate(GEOID = as.character(GEOID))
-mod_data2 <- mod_data2 |>
-  dplyr::mutate(GEOID = as.character(GEOID)) |>
-  dplyr::left_join(wx_join, by = "GEOID")
-cat("  Wx columns merged into mod_data2: ",
-    sum(grepl("^wx_", names(mod_data2))), "\n")
-
-
-n_pre_wx <- nrow(mod_data2)
-mod_data2_wx <- mod_data2 |>
-  tidyr::drop_na(dplyr::all_of(paste0("wx_", WX_PREDICTORS)))
-n_drop_wx <- n_pre_wx - nrow(mod_data2_wx)
-cat("  Rows dropped due to NA Wx values: ", n_drop_wx, " of ", n_pre_wx,
-    " (", round(100 * n_drop_wx / n_pre_wx, 1), "%)\n", sep = "")
-
-# ---- 6.6c. Refit OLS with focal + Wx -------------------------
-
-fml_wx_str <- paste(
-  "ckm_core_pca ~",
-  paste(c(core_predictors, env_predictors, aging_env_terms,
-          paste0("wx_", WX_PREDICTORS)), collapse = " + ")
-)
-fml_wx <- stats::as.formula(fml_wx_str)
-cat("  OLS focal+Wx — fitting...\n")
-ols_wx <- lm(fml_wx, data = mod_data2_wx)
-r2_wx       <- summary(ols_wx)$r.squared
-r2_focal    <- summary(ols_full2)$r.squared
-cat(sprintf("    R² (focal+Wx)    = %.4f\n", r2_wx))
-cat(sprintf("    R² (focal-only)  = %.4f\n", r2_focal))
-cat(sprintf("    ΔR²              = +%.4f\n", r2_wx - r2_focal))
-
-# Residual Moran's I after Wx
-
-mod_geo_wx <- mod_geo[match(mod_data2_wx$GEOID, mod_geo$GEOID), ]
-coords_wx  <- mod_geo_wx |>
-  sf::st_centroid(of_largest_polygon = TRUE) |>
-  sf::st_coordinates()
-nb_wx <- spdep::knn2nb(spdep::knearneigh(coords_wx, k = 8), sym = TRUE)
-lw_wx <- spdep::nb2listw(nb_wx, style = "W", zero.policy = TRUE)
-mi_wx <- spdep::moran.test(residuals(ols_wx), lw_wx,
-                            zero.policy = TRUE, randomisation = TRUE)
-cat(sprintf("    Residual Moran's I (focal+Wx) = %.3f\n",
-            mi_wx$estimate["Moran I statistic"]))
-cat(sprintf("    Residual Moran's I (focal-only) = %.3f\n",
-            mi_resid$estimate["Moran I statistic"]))
-cat(sprintf("    ΔI                        = %+.3f\n",
-            mi_wx$estimate["Moran I statistic"] -
-            mi_resid$estimate["Moran I statistic"]))
-
-# ---- 6.6d. Refit BYM2 with focal + Wx ------------------------
-f_bym2_wx <- file.path(dir_proc, "06_6d_inla_bym2_wx.rds")
-have_inla <- requireNamespace("INLA", quietly = TRUE)
-
-# Auto-invalidate the BYM2-Wx cache when:
-
-if (file.exists(f_bym2_wx)) {
-  cached_wx <- tryCatch(readRDS(f_bym2_wx), error = function(e) NULL)
-  invalidate_wx <- FALSE
-  invalidate_reason <- ""
-  if (!is.null(cached_wx) &&
-      abs(cached_wx$n - nrow(mod_data2_wx)) > 1000) {
-    invalidate_wx     <- TRUE
-    invalidate_reason <- paste0(
-      "n drift (cache n=", cached_wx$n,
-      ", current Wx n=", nrow(mod_data2_wx), ")")
-  }
-  aq_mtime <- file.info(file.path(dir_proc, "01f_aq_tract.rds"))$mtime
-  wx_mtime <- file.info(f_bym2_wx)$mtime
-  if (!is.na(aq_mtime) && !is.na(wx_mtime) && aq_mtime > wx_mtime) {
-    invalidate_wx     <- TRUE
-    invalidate_reason <- paste0(
-      "AQ surface (01f_aq_tract.rds) is newer than BYM2-Wx cache; ",
-      "upstream env predictors changed")
-  }
-  # Predictor-set drift: cached fixed-effect names != current expected
-  if (!invalidate_wx && !is.null(cached_wx) &&
-      !is.null(cached_wx$summary_fixed)) {
-    cached_terms_wx <- setdiff(rownames(cached_wx$summary_fixed), c("(Intercept)", "island"))
-    current_terms_wx <- tryCatch(
-      colnames(model.matrix(fml_wx, data = head(mod_data2_wx, 5)))[-1],
-      error = function(e) character(0))
-    if (length(current_terms_wx) > 0 &&
-        !identical(sort(cached_terms_wx), sort(current_terms_wx))) {
-      invalidate_wx     <- TRUE
-      invalidate_reason <- paste0(
-        "predictor-set drift (cached ", length(cached_terms_wx),
-        " fixed effects, current ", length(current_terms_wx), ")")
-    }
-  }
-  if (invalidate_wx) {
-    message("BYM2-Wx cache invalidated: ", invalidate_reason,
-            "; refitting BYM2 with current focal+Wx predictors.")
-    file.remove(f_bym2_wx)
-  }
-}
-
-if (have_inla && !file.exists(f_bym2_wx)) {
-  message("Fitting BYM2 with focal + Wx (this may take 10-20 min)...")
-  graph_file <- file.path(dir_graph, "06_inla_graph.adj")
-  if (!file.exists(graph_file))
-    .nbfast(graph_file, nb_mod)
-
-  mod_data2_wx$idarea <- match(mod_data2_wx$GEOID, mod_geo$GEOID)
-  bym2_data_wx <- mod_data2_wx |> dplyr::filter(!is.na(idarea))
-
-  fml_bym2_wx <- stats::as.formula(
-    paste(fml_wx_str,
-          "+ f(idarea, model = 'bym2', graph = '", graph_file,
-          "', scale.model = TRUE,",
-          "    hyper = list(phi  = list(prior = 'pc',",
-          "                              param = c(0.5, 0.5)),",
-          "                 prec = list(prior = 'pc.prec',",
-          "                              param = c(1, 0.01))))",
-          sep = ""))
-
-  t0 <- Sys.time()
-  bym2_wx_fit <- .inla_isl(
-    fml_bym2_wx, data = bym2_data_wx, family = "gaussian",
-    control.predictor = list(compute = TRUE),
-    control.compute   = list(dic = TRUE, waic = TRUE,
-                              return.marginals.predictor = FALSE),
-    control.inla      = list(strategy = "adaptive",
-                              int.strategy = "eb"),
-    verbose = FALSE
-  )
-  message("  BYM2-Wx done in ",
-          round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
-
-  bym2_wx_save <- list(
-    summary_fixed  = bym2_wx_fit$summary.fixed,
-    summary_random = bym2_wx_fit$summary.random$idarea,
-    dic            = bym2_wx_fit$dic$dic,
-    waic           = bym2_wx_fit$waic$waic,
-    n              = nrow(bym2_data_wx),
-    formula        = paste(deparse(fml_bym2_wx), collapse = " ")
-  )
-  saveRDS(bym2_wx_save, f_bym2_wx)
-  cat("  saved: ", f_bym2_wx, "\n")
-} else if (file.exists(f_bym2_wx)) {
-  bym2_wx_save <- readRDS(f_bym2_wx)
-  message("  BYM2-Wx cached: ", f_bym2_wx)
-} else {
-  message("  INLA not installed; BYM2-Wx skipped.")
-  bym2_wx_save <- NULL
-}
-
-# ---- 6.6e. Coefficient comparison: focal-only vs. focal+Wx ----
-if (have_inla && !is.null(bym2_wx_save)) {
-  bym2_focal_df <- tibble::as_tibble(bym2_save$summary_fixed,
-                                      rownames = "predictor") |>
-    dplyr::transmute(predictor,
-                     focal_only_mean = mean,
-                     focal_only_2.5  = `0.025quant`,
-                     focal_only_97.5 = `0.975quant`)
-  bym2_wx_df <- tibble::as_tibble(bym2_wx_save$summary_fixed,
-                                   rownames = "predictor") |>
-    dplyr::transmute(predictor,
-                     focal_wx_mean = mean,
-                     focal_wx_2.5  = `0.025quant`,
-                     focal_wx_97.5 = `0.975quant`)
-  bym2_compare <- dplyr::full_join(bym2_focal_df, bym2_wx_df,
-                                    by = "predictor") |>
-    dplyr::mutate(
-      pct_change = ifelse(!is.na(focal_only_mean) & focal_only_mean != 0,
-                          round(100 * (focal_wx_mean - focal_only_mean) /
-                                  abs(focal_only_mean), 1),
-                          NA_real_)
-    )
-  readr::write_csv(bym2_compare,
-                    file.path(dir_tbl, "06_6e_bym2_focal_vs_wx.csv"))
-  cat("  saved: ", file.path(dir_tbl, "06_6e_bym2_focal_vs_wx.csv"), "\n")
-
-  # Wx-only effects (the new neighborhood terms)
-  wx_only <- bym2_wx_df |>
-    dplyr::filter(grepl("^wx_", predictor)) |>
-    dplyr::mutate(focal_predictor = sub("^wx_", "", predictor)) |>
-    dplyr::transmute(focal_predictor,
-                     wx_mean = round(focal_wx_mean, 4),
-                     wx_2.5  = round(focal_wx_2.5, 4),
-                     wx_97.5 = round(focal_wx_97.5, 4),
-                     credible = ifelse(focal_wx_2.5 > 0 |
-                                       focal_wx_97.5 < 0, "Yes", "No"))
-  cat("\n--- BYM2 Wx (neighborhood) effects ---\n")
-  print(wx_only)
-  readr::write_csv(wx_only,
-                    file.path(dir_tbl,
-                              "06_6e_bym2_wx_neighborhood_effects.csv"))
-
-  # Summary of changes in focal effects after Wx augmentation
-  focal_drift <- bym2_compare |>
-    dplyr::filter(!grepl("^wx_", predictor),
-                  predictor != "(Intercept)",
-                  !is.na(pct_change)) |>
-    dplyr::arrange(dplyr::desc(abs(pct_change)))
-  cat("\n--- Focal-effect drift after Wx augmentation (top 10 by |%|) ---\n")
-  print(head(focal_drift |>
-               dplyr::select(predictor, focal_only_mean,
-                              focal_wx_mean, pct_change), 10))
-}
-
-# ---- 6.6f. Fit-improvement summary table ----------------------
-fit_summary_wx <- tibble::tibble(
-  model = c("OLS focal-only",
-            "OLS focal+Wx",
-            "BYM2 focal-only",
-            "BYM2 focal+Wx"),
-  n     = c(nrow(mod_data2),
-            nrow(mod_data2_wx),
-            bym2_save$n,
-            if (!is.null(bym2_wx_save)) bym2_wx_save$n else NA_real_),
-  R2_or_DIC = c(
-    sprintf("R² = %.4f", r2_focal),
-    sprintf("R² = %.4f", r2_wx),
-    sprintf("DIC = %.0f, WAIC = %.0f", bym2_save$dic, bym2_save$waic),
-    if (!is.null(bym2_wx_save))
-      sprintf("DIC = %.0f, WAIC = %.0f",
-              bym2_wx_save$dic, bym2_wx_save$waic) else "skipped"
-  ),
-  resid_moranI = c(
-    # NOTE: mi_resid is the six-predictor BASELINE OLS (section 5c),
-    # not the focal-only full-covariate OLS this row is labelled with. The
-    # manuscript reports the focal-only value (0.518) from
-    # 29_derived_tables.R -> 29_residual_moran_full_ols.csv.
-    sprintf("%.3f", mi_resid$estimate["Moran I statistic"]),
-    sprintf("%.3f", mi_wx$estimate["Moran I statistic"]),
-    "—", "—"
-  )
-)
-cat("\n--- Section 6.6 fit-improvement summary ---\n")
-print(fit_summary_wx)
-readr::write_csv(fit_summary_wx,
-                  file.path(dir_tbl, "06_6f_wx_fit_summary.csv"))
-cat("  saved: ", file.path(dir_tbl, "06_6f_wx_fit_summary.csv"), "\n")
-
-cat("\n=== Section 6.6 complete. ===\n")
-cat("  Decision rule:\n")
-cat("    If a Wx coefficient's CrI excludes 0, the neighborhood effect\n")
-cat("    is credibly different from the focal effect — meaning what\n")
-cat("    happens NEXT DOOR matters above and beyond what happens IN\n")
-cat("    the tract. If multiple Wx terms are credible AND residual\n")
-cat("    Moran's I drops substantially, the BYM2 random structure is\n")
-cat("    absorbing less of the spatial signal — interpretation moves\n")
-cat("    from 'unmeasured confounders' to 'spatial spillover'.\n")
+cat("  Next: behavioral-drop BYM2 (Section 6.7)\n")
 
 
 # ==============================================================
@@ -4131,7 +2707,7 @@ cat("  Reduced model: ", length(reduced_core), " core + ",
     length(aging_env_terms), " aging x env terms\n", sep = "")
 
 f_bym2_nb <- file.path(dir_proc, "06_6g_inla_bym2_nobehav.rds")
-# Reuse the have_inla flag set upstream in Section 6e/6.6.
+# Reuse the have_inla flag set upstream in Section 6e.
 
 # Auto-invalidate on predictor-set drift, same discipline as the focal fit.
 if (file.exists(f_bym2_nb)) {
@@ -4245,90 +2821,6 @@ if (have_inla && !is.null(bym2_nb_save)) {
       file.path(dir_tbl, "06_6g_fit_nobehav.csv"), "\n")
 
 
-  if (!is.null(bym2_save) && !is.null(bym2_save$summary_random)) {
-    message("Building two-panel BYM2 spatial random-effect map...")
-
-
-    .re_geo_of <- function(sv) {
-      rd <- tibble::as_tibble(sv$summary_random)
-      if (!"idarea" %in% names(rd) && "ID" %in% names(rd))
-        names(rd)[match("ID", names(rd))] <- "idarea"
-      rd <- head(rd, nrow(mod_geo))
-      rd$GEOID <- mod_geo$GEOID
-      tracts_geo |>
-        dplyr::mutate(GEOID = stringr::str_trim(enc2utf8(as.character(GEOID)))) |>
-        dplyr::inner_join(
-          rd |> dplyr::select(GEOID, mean) |>
-            dplyr::mutate(GEOID = stringr::str_trim(enc2utf8(as.character(GEOID)))),
-          by = "GEOID") |>
-        dplyr::filter(!substr(GEOID, 1, 2) %in% c("60", "66", "69", "72", "78"),
-                      ALAND > 0) |>
-        sf::st_transform(4326) |>
-        tigris::shift_geometry(geoid_column = "GEOID",
-                               preserve_area = FALSE, position = "below")
-    }
-
-    re_adj <- .re_geo_of(bym2_save)      # Model 2: behavior-adjusted
-    re_exc <- .re_geo_of(bym2_nb_save)   # Model 1: behavior-excluded
-
-    re_lim2 <- max(abs(quantile(re_adj$mean, c(0.02, 0.98), na.rm = TRUE)),
-                   abs(quantile(re_exc$mean, c(0.02, 0.98), na.rm = TRUE)))
-
-
-    .bym2_panel <- function(d, tag, ttl, sub) {
-      ggplot() +
-        geom_sf(data = d, aes(fill = mean), colour = NA) +
-        geom_sf(data = nj_unavail, fill = NJ_UNAVAIL_FILL, colour = NA) +
-        geom_sf(data = states_conus, fill = NA, colour = "grey25",
-                linewidth = 0.25) +
-        scale_fill_gradient2(
-          low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
-          limits = c(-re_lim2, re_lim2), oob = scales::squish,
-          name = "Spatial\nrandom effect\n(PC1 score units)") +
-        coord_sf(datum = NA) +
-        theme_void(base_size = 19) +
-        theme(plot.title    = element_text(face = "bold", size = 19),
-              plot.subtitle = element_text(colour = "grey30", size = 14),
-              plot.tag      = element_text(face = "bold", size = 22),
-              legend.title  = element_text(size = 17),
-              legend.text   = element_text(size = 15)) +
-        labs(tag = tag, title = ttl, subtitle = sub)
-    }
-
-    p_fig6 <- patchwork::wrap_plots(
-      .bym2_panel(re_exc, "A", "Model 1 - behavior-excluded",
-                  "Behavioral/healthcare-engagement block removed"),
-      .bym2_panel(re_adj, "B", "Model 2 - behavior-adjusted",
-                  "Behavioral/healthcare-engagement block included"),
-      nrow = 1, guides = "collect")
-
-    ggsave(file.path(dir_fig, "06h_bym2_spatial_random_effect_2panel.png"),
-           p_fig6, width = 13, height = 5.6, dpi = 220, bg = "white")
-    cat("  saved: ",
-        file.path(dir_fig, "06h_bym2_spatial_random_effect_2panel.png"), "\n")
-
-
-    .south_fips <- c("01", "05", "10", "11", "12", "13", "21", "22", "24",
-                     "28", "37", "40", "45", "47", "48", "51", "54")
-    for (.nm in c("Model 1", "Model 2")) {
-      .dd  <- sf::st_drop_geometry(if (.nm == "Model 1") re_exc else re_adj)
-      .iss <- substr(.dd$GEOID, 1, 2) %in% .south_fips
-      cat(sprintf(
-        "  %s  South %+.3f (%.1f%% pos) | non-South %+.3f (%.1f%% pos)\n",
-        .nm, mean(.dd$mean[.iss]),  100 * mean(.dd$mean[.iss]  > 0),
-             mean(.dd$mean[!.iss]), 100 * mean(.dd$mean[!.iss] > 0)))
-    }
-
-    
-    .sm <- sf::st_drop_geometry(re_exc)
-    .sm$state <- substr(.sm$GEOID, 1, 2)
-    .sm <- aggregate(mean ~ state, .sm, base::mean)
-    .sm <- .sm[order(-.sm$mean), ][1:8, ]
-    .sm$south <- ifelse(.sm$state %in% .south_fips, "South", "")
-    cat("\n  Model 1 - highest state mean random effects:\n")
-    print(.sm, row.names = FALSE, digits = 3)
-  }
-
   # WITH-behavioral (bym2_save, Section 6e) vs WITHOUT (bym2_nb_save)
   with_df <- tibble::as_tibble(bym2_save$summary_fixed,
                                rownames = "predictor") |>
@@ -4374,48 +2866,6 @@ if (have_inla && !is.null(bym2_nb_save)) {
 }
 
 # ==============================================================
-# 6.8  KIDNEY LOADING ASYMMETRY  
-# ==============================================================
-
-f_load_cmp <- file.path(dir_tbl, "04_pc1_loadings_compare.csv")
-if (file.exists(f_load_cmp)) {
-  load_cmp <- readr::read_csv(f_load_cmp, show_col_types = FALSE)
-  if (all(c("NHANES_PC1", "PLACES_PC1") %in% names(load_cmp))) {
-    load_asym <- load_cmp |>
-      dplyr::mutate(
-        loading_gap = PLACES_PC1 - NHANES_PC1,
-        rel_gap_pct = ifelse(NHANES_PC1 != 0,
-                             round(100 * (PLACES_PC1 - NHANES_PC1) /
-                                     abs(NHANES_PC1), 1), NA_real_)
-      ) |>
-      dplyr::arrange(dplyr::desc(abs(loading_gap)))
-    readr::write_csv(load_asym,
-                      file.path(dir_tbl, "04_pc1_loading_asymmetry.csv"))
-    cat("\n=== Section 6.8  PC1 loading asymmetry (PLACES - NHANES) ===\n")
-    print(load_asym)
-    cat("  saved: ",
-        file.path(dir_tbl, "04_pc1_loading_asymmetry.csv"), "\n")
-    kid <- load_asym |> dplyr::filter(toupper(Indicator) == "KIDNEY")
-    if (nrow(kid) == 1)
-      cat(sprintf(
-        "  KIDNEY: PLACES loading %.3f vs NHANES %.3f (gap %+.3f, %+.0f%%)\n",
-        kid$PLACES_PC1, kid$NHANES_PC1, kid$loading_gap, kid$rel_gap_pct))
-  }
-} else {
-  cat("\n  [6.8] ", f_load_cmp, " not found; run Section 4 first.\n", sep = "")
-}
-
-# ==============================================================
-# 6.9  MAUP COUNTY RE-AGGREGATION  
-# ==============================================================
-
-f_maup <- file.path(dir_tbl, "08_maup_county.csv")
-if (file.exists(f_maup))
-  cat("\n  [6.9] County MAUP re-aggregation available for main-text ",
-      "elevation: ", f_maup, "\n", sep = "")
-
-
-# ==============================================================
 # 7.  ML PILLAR  (XGBoost + spatial block CV + SHAP)
 # ==============================================================
 
@@ -4425,7 +2875,6 @@ if (file.exists(f_maup))
 #   data/processed/07_shap.rds         — SHAP values matrix (50k × 14)
 #   output/tables/07_shap_global.csv   — global SHAP importance ranking
 #   output/figures/07_shap_summary.png — beeswarm-style importance plot
-#   output/figures/07_age_pm25_interaction.png — partial-dependence interaction
 
 cat("\n========================================================\n")
 cat("Section 7 — ML pillar (XGBoost + spatial CV + SHAP)\n")
@@ -4695,7 +3144,7 @@ cv_gap <- cv_summary$r2_mean[cv_summary$scheme == "random"] -
 cat("\n  Spatial-leakage gap (random R² − spatial R²): ",
     sprintf("%.3f", cv_gap), "\n",
     "  (Larger gap = more spatial autocorrelation leakage.\n",
-    "   Manuscript framing: 'Honest out-of-area performance is\n",
+    "   Interpretation: 'Honest out-of-area performance is\n",
     "   captured by the spatial block CV R².')\n", sep = "")
 
 # ---- 7e. SHAP — global + local explanations --------------------
@@ -4810,137 +3259,6 @@ ggsave(file.path(dir_fig, "07_shap_summary.png"),
        p_shap, width = 10, height = 5.5, dpi = 220, bg = "white")
 cat("  saved: ", file.path(dir_fig, "07_shap_summary.png"), "\n")
 
-# ---- 7h. Aging × env interaction visualization ----------------
-
-shap_age <- shap_vals[, "pct_age_65_plus"]
-env_in_X <- intersect(env_predictors, colnames(X_full))
-
-
-.to_native <- function(v, x) {
-  if (!exists("interact_means") || !v %in% names(interact_means)) return(x)
-  x <- x + interact_means[[v]]
-  if (v == "o3_8hrmax_4thmax") x <- x * 10   # 10-ppb units -> ppb
-  x
-}
-age_native <- .to_native("pct_age_65_plus", X_full[, "pct_age_65_plus"])
-
-interaction_df <- purrr::map_dfr(env_in_X, function(env_var) {
-  vals <- X_full[, env_var]
-  is_binary <- length(unique(vals[!is.na(vals)])) <= 2
-  tibble::tibble(
-    env_var    = env_var,
-    env_value  = .to_native(env_var, vals),
-    shap_age   = shap_age,
-    age_value  = age_native,
-    is_binary  = is_binary
-  )
-})
-
-# Figure-8 facet labels: 
-fig8_pretty <- c(predictor_pretty,
-                 o3_8hrmax_4thmax = "Annual 4th-highest 8-hr O₃ (ppb)")
-fig8_pretty <- fig8_pretty[!duplicated(names(fig8_pretty), fromLast = TRUE)]
-.label_fig8 <- function(x) unname(fig8_pretty[as.character(x)])
-
-# Continuous env predictors → scatter + loess (non-binary panels)
-cont_df  <- interaction_df |> dplyr::filter(!is_binary)
-# Binary predictors (e.g. LILATracts_1And10 = 0/1) → boxplot of SHAP(age)
-
-bin_df   <- interaction_df |> dplyr::filter(is_binary)
-
-
-
-p_cont <- ggplot(cont_df,
-                 aes(x = env_value, y = shap_age, colour = age_value)) +
-  geom_point(alpha = 0.2, size = 0.4) +
-  geom_smooth(colour = "black", se = FALSE,
-              method = "loess", formula = y ~ x, span = 0.5) +
-  facet_wrap(~ env_var, scales = "free_x", ncol = 2,
-             labeller = ggplot2::as_labeller(.label_fig8)) +
-  scale_colour_viridis_c(name = "% age 65+") +
-  labs(x = "Environmental predictor value (original measurement scale)",
-       y = "SHAP value for % adults age 65+",
-       subtitle = "Continuous exposures — loess trend") +
-  theme_ckm
-
-if (nrow(bin_df) > 0) {
-  p_bin <- ggplot(bin_df,
-                  aes(x = factor(env_value, levels = c("0", "1"),
-                                  labels = c("Not LILA", "LILA")),
-                      y = shap_age,
-                      fill = factor(env_value))) +
-    geom_violin(alpha = 0.4, scale = "width", colour = NA) +
-    geom_boxplot(width = 0.15, outlier.alpha = 0.05, fill = "white") +
-    facet_wrap(~ env_var, ncol = 2,
-               labeller = ggplot2::as_labeller(.label_fig8)) +
-    scale_fill_manual(values = c("0" = "#2166AC", "1" = "#B2182B"),
-                       guide = "none") +
-    labs(x = "Tract food-access status",
-         y = "SHAP value for % adults age 65+",
-         subtitle = "Binary exposure — violin + boxplot") +
-    theme_ckm
-  p_interact <- p_cont / p_bin +
-    patchwork::plot_layout(heights = c(2, 1)) +
-    patchwork::plot_annotation(
-      title = "Dependence of the aging SHAP attribution on environmental predictors",
-     
-      subtitle = paste0("Descriptive dependence of the aging SHAP contribution on each exposure.\n",
-                        "A non-flat trend is consistent with an interaction but does not isolate one:\n",
-                        "it can also arise from predictor correlation or main-effect nonlinearity.")
-    )
-} else {
-  p_interact <- p_cont +
-    labs(title = "Dependence of the aging SHAP attribution on environmental predictors")
-}
-
-ggsave(file.path(dir_fig, "07_age_env_interactions.png"),
-       p_interact, width = 9, height = 8, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "07_age_env_interactions.png"), "\n")
-
-# ---- Aging x environment SHAP figure: companion data -------------------
-
-fig8_cont_data <- purrr::map_dfr(unique(cont_df$env_var), function(v) {
-  d <- cont_df |>
-    dplyr::filter(env_var == v, is.finite(env_value), is.finite(shap_age))
-  fit <- stats::loess(shap_age ~ env_value, data = d, span = 0.5)
-  gx  <- seq(min(d$env_value), max(d$env_value), length.out = 25)
-  tibble::tibble(
-    panel       = "continuous",
-    env_var     = v,
-    label       = unname(fig8_pretty[v]),
-    x           = gx,
-    level       = NA_character_,
-    n_panel     = nrow(d),
-    n_at_or_below_x = vapply(gx, function(g) sum(d$env_value <= g), integer(1)),
-    loess_shap  = as.numeric(stats::predict(fit,
-                    newdata = data.frame(env_value = gx))),
-    median_shap = NA_real_, q25_shap = NA_real_, q75_shap = NA_real_)
-})
-
-fig8_bin_data <- if (nrow(bin_df) > 0) {
-  bin_df |>
-    dplyr::filter(is.finite(shap_age)) |>
-    dplyr::group_by(env_var, env_value) |>
-    dplyr::summarise(
-      n_panel     = dplyr::n(),
-      median_shap = stats::median(shap_age),
-      q25_shap    = stats::quantile(shap_age, 0.25),
-      q75_shap    = stats::quantile(shap_age, 0.75),
-      .groups     = "drop") |>
-    dplyr::transmute(
-      panel = "binary", env_var,
-      label = unname(fig8_pretty[env_var]),
-      x = NA_real_,
-      level = ifelse(env_value == 1, "LILA", "Not LILA"),
-      n_panel, n_at_or_below_x = NA_integer_, loess_shap = NA_real_,
-      median_shap, q25_shap, q75_shap)
-} else NULL
-
-fig8_data <- dplyr::bind_rows(fig8_cont_data, fig8_bin_data)
-readr::write_csv(fig8_data,
-                 file.path(dir_tbl, "07_age_env_interaction_loess.csv"))
-cat("  saved: ", file.path(dir_tbl, "07_age_env_interaction_loess.csv"), "\n")
-
 cat("\n=== Section 7 complete. ===\n")
 cat("  In-sample R²: ",        round(r2_insample, 4), "\n")
 cat("  Random CV R²: ",        round(cv_summary$r2_mean[cv_summary$scheme == "random"], 4), "\n")
@@ -4959,7 +3277,6 @@ cat("  Block ranking: ", paste(block_imp$block, collapse = " > "), "\n")
 # Output:
 #   data/processed/08_*.rds
 #   output/tables/08_*.csv
-#   output/figures/08_alt_weights_moranI.png
 
 cat("\n========================================================\n")
 cat("Section 8 — Sensitivity analyses (MAUP, alt W, strata)\n")
@@ -4976,7 +3293,7 @@ cat("========================================================\n")
 }, character(1)), collapse = "|")
 .s8_sig_file <- file.path(dir_proc, "08_datascale.sig")
 .s8_caches <- file.path(dir_proc,
-  c("08_maup_county.rds", "08_ruca_strata.rds", "08_svi_sensitivity.rds"))
+  c("08_ruca_strata.rds"))
 .s8_prev_sig <- if (file.exists(.s8_sig_file))
   readLines(.s8_sig_file, warn = FALSE)[1] else NA_character_
 if (!is.na(.s8_prev_sig) && !identical(.s8_prev_sig, .s8_sig)) {
@@ -4990,126 +3307,6 @@ if (!is.na(.s8_prev_sig) && !identical(.s8_prev_sig, .s8_sig)) {
 }
 writeLines(.s8_sig, .s8_sig_file)
 
-# ---- 8a. MAUP: county-scale re-fit ------------------------------
-
-f_maup <- file.path(dir_proc, "08_maup_county.rds")
-
-
-maup_code_version <- "2026-08-28_county-only-groupby_popweighted-lm"
-
-maup_cache_ok <- FALSE
-if (file.exists(f_maup)) {
-  maup_obj <- readRDS(f_maup)
-  maup_cache_ok <- identical(maup_obj$code_version, maup_code_version)
-  if (!maup_cache_ok)
-    message("  MAUP cache was built by an older code version; recomputing.")
-}
-
-if (!maup_cache_ok) {
-  message("Aggregating tract values to county (population-weighted)...")
-
-  # Pull total_pop from `analytic` if available; else use uniform weights.
-  if (exists("analytic", envir = .GlobalEnv) &&
-      "total_pop" %in% names(analytic)) {
-    pop_lookup <- analytic |>
-      dplyr::select(GEOID, total_pop) |>
-      dplyr::mutate(GEOID = as.character(GEOID))
-    mod_data2 <- mod_data2 |>
-      dplyr::mutate(GEOID = as.character(GEOID)) |>
-      dplyr::left_join(pop_lookup, by = "GEOID")
-    mod_data2$w <- ifelse(is.na(mod_data2$total_pop) | mod_data2$total_pop == 0,
-                          1, mod_data2$total_pop)
-    message("  using ACS total_pop weights")
-  } else {
-    mod_data2$w <- 1
-    message("  total_pop unavailable; using uniform tract weights")
-  }
-
-
-  maup_core <- c("ckm_core_pca", "pct_age_65_plus", "ice_race", "ice_income",
-                 "pct_hispanic", "pct_bachelor_plus")
-  maup_env  <- intersect(
-    c("pm25_annual", "o3_8hrmax_4thmax", "LILATracts_1And10",
-      "tmax_warm", "walk_index"),
-    names(mod_data2)
-  )
-
-
-  ruca_dom <- mod_data2 |>
-    dplyr::mutate(county_fips = substr(GEOID, 1, 5)) |>
-    dplyr::group_by(county_fips, ruca_class) |>
-    dplyr::summarise(wsum = sum(w, na.rm = TRUE), .groups = "drop_last") |>
-    dplyr::slice_max(wsum, n = 1, with_ties = FALSE) |>
-    dplyr::ungroup() |>
-    dplyr::select(county_fips, ruca_class)
-
-  county_data <- mod_data2 |>
-    dplyr::mutate(county_fips = substr(GEOID, 1, 5)) |>
-    dplyr::group_by(county_fips) |>              # county only: one row per county
-    dplyr::summarise(
-      dplyr::across(
-        dplyr::all_of(c(maup_core, maup_env)),
-        ~ stats::weighted.mean(.x, w = w, na.rm = TRUE)
-      ),
-      pop      = sum(w, na.rm = TRUE),   # county population = regression weight
-      n_tracts = dplyr::n(),
-      .groups = "drop"
-    ) |>
-    dplyr::left_join(ruca_dom, by = "county_fips") |>
-    tidyr::drop_na()
-
-  stopifnot(nrow(county_data) == dplyr::n_distinct(county_data$county_fips))
-  cat("  Counties (post-aggregation): ", nrow(county_data), "\n")
-  if (length(maup_env) < 5)
-    message("  NOTE: MAUP using ", length(maup_env), "/5 env predictors (",
-            paste(maup_env, collapse = ", "), ")")
-
-  maup_inter <- if (length(maup_env))
-    paste0("pct_age_65_plus:", maup_env) else character(0)
-  maup_rhs <- paste(c("pct_age_65_plus", "ice_race", "ice_income",
-                      "pct_hispanic", "pct_bachelor_plus",
-                      maup_env, maup_inter), collapse = " + ")
-  maup_fml <- stats::as.formula(paste("ckm_core_pca ~", maup_rhs))
-
-
-  ols_county    <- lm(maup_fml, data = county_data, weights = pop)
-  ols_county_un <- lm(maup_fml, data = county_data)
-
-  maup_obj <- list(model = ols_county, n = nrow(county_data),
-                   summary = summary(ols_county),
-                   model_unweighted   = ols_county_un,
-                   summary_unweighted = summary(ols_county_un),
-                   weighting = "population (w = total_pop); unweighted retained as sensitivity",
-                   code_version = maup_code_version)
-  saveRDS(maup_obj, f_maup)
-  message("  saved: ", f_maup)
-} else {
-  ols_county    <- maup_obj$model
-  ols_county_un <- maup_obj$model_unweighted
-  message("  MAUP cached (code version ", maup_code_version, ").")
-}
-
-cat("\n--- (8a) County-scale OLS coefficients (population-weighted) ---\n")
-print(round(coef(summary(ols_county))[, c("Estimate", "Std. Error",
-                                            "Pr(>|t|)")], 4))
-cat("\n  N counties: ", maup_obj$n, "\n")
-cat("  R² (weighted):   ", round(summary(ols_county)$r.squared, 3), "\n")
-cat("  R² (unweighted): ", round(summary(ols_county_un)$r.squared, 3), "\n")
-
-
-maup_compare <- broom::tidy(ols_county) |>
-  dplyr::transmute(predictor = term,
-                   county_estimate = round(estimate, 4),
-                   county_p        = round(p.value, 4)) |>
-  dplyr::left_join(
-    broom::tidy(ols_county_un) |>
-      dplyr::transmute(predictor = term,
-                       county_estimate_unweighted = round(estimate, 4),
-                       county_p_unweighted        = round(p.value, 4)),
-    by = "predictor")
-readr::write_csv(maup_compare, file.path(dir_tbl, "08_maup_county.csv"))
-cat("  saved: ", file.path(dir_tbl, "08_maup_county.csv"), "\n")
-
 # ---- 8b. Alternative spatial weights ----------------------------
 
 f_altw <- file.path(dir_proc, "08_alt_weights.rds")
@@ -5122,7 +3319,7 @@ if (file.exists(f_altw)) {
   altw_obj <- readRDS(f_altw)
   altw_cache_ok <- identical(altw_obj$code_version, altw_code_version)
   if (!altw_cache_ok)
-    message("  Alt-weights cache was built by an older code version; recomputing.")
+    message("  Alt-weights cache settings differ from the current code; recomputing.")
 }
 
 if (!altw_cache_ok) {
@@ -5178,20 +3375,6 @@ cat("\n--- (8b) Residual Moran's I across spatial weights ---\n")
 print(alt_w_tbl)
 readr::write_csv(alt_w_tbl, file.path(dir_tbl, "08_alt_weights.csv"))
 
-p_altw <- ggplot(alt_w_tbl,
-                 aes(x = reorder(weights, moran_I), y = moran_I)) +
-  geom_col(fill = "#FD8D3C") +
-  geom_text(aes(label = sprintf("%.3f", moran_I)),
-            hjust = -0.1, size = 3) +
-  coord_flip(ylim = c(0, max(alt_w_tbl$moran_I) * 1.15)) +
-  labs(x = NULL, y = "Moran's I on OLS residuals",
-       title = "Residual spatial autocorrelation across W specifications",
-       subtitle = "Stable across k = 5/8/20 + queen ⇒ robust spatial signal") +
-  theme_ckm
-ggsave(file.path(dir_fig, "08_alt_weights_moranI.png"),
-       p_altw, width = 8, height = 4.5, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "08_alt_weights_moranI.png"), "\n")
-
 # ---- 8c. RUCA-stratified OLS ------------------------------------
 
 f_strat <- file.path(dir_proc, "08_ruca_strata.rds")
@@ -5204,7 +3387,7 @@ if (file.exists(f_strat)) {
   strat_obj <- readRDS(f_strat)
   strat_cache_ok <- identical(strat_obj$code_version, strat_code_version)
   if (!strat_cache_ok)
-    message("  Strata cache was built by an older code version; recomputing.")
+    message("  Strata cache settings differ from the current code; recomputing.")
 }
 
 if (!strat_cache_ok) {
@@ -5269,7 +3452,6 @@ readr::write_csv(strata_compare, file.path(dir_tbl, "08_ruca_strata.csv"))
 cat("  saved: ", file.path(dir_tbl, "08_ruca_strata.csv"), "\n")
 
 cat("\n=== Section 8 complete. ===\n")
-cat("  MAUP (county) R²:    ", round(summary(ols_county)$r.squared, 3), "\n")
 cat("  Moran's I range across W: [",
     sprintf("%.3f", min(alt_w_tbl$moran_I)), ", ",
     sprintf("%.3f", max(alt_w_tbl$moran_I)), "]\n", sep = "")
@@ -5277,57 +3459,6 @@ cat("  Strata fit:          ",
     paste(vapply(strata_fits, function(s)
                   paste0(s$stratum, " (n=", s$n, ")"), character(1)),
           collapse = " | "), "\n")
-
-
-# ---- 8d. SVI-replacement sensitivity (OLS form) -----------------
-
-f_svi_sens <- file.path(dir_proc, "08_svi_sensitivity.rds")
-svi_terms <- c("svi_ses", "svi_minor", "svi_trans")
-have_svi <- all(svi_terms %in% names(mod_data2))
-if (have_svi && !file.exists(f_svi_sens)) {
-  cat("\n---- 8d. SVI-replacement sensitivity (OLS) ----\n")
-  ice_terms <- c("ice_race", "ice_income", "pct_unemployed", "pct_bachelor_plus")
-  preds_no_ice <- setdiff(core_predictors, ice_terms)
-  preds_svi    <- c(preds_no_ice, svi_terms)
-  fml_svi <- stats::as.formula(paste("ckm_core_pca ~",
-    paste(c(preds_svi, env_predictors, aging_env_terms), collapse = " + ")))
-  d_svi <- tidyr::drop_na(mod_data2,
-                          dplyr::all_of(c("ckm_core_pca", svi_terms,
-                                          preds_no_ice, env_predictors)))
-  ols_svi <- stats::lm(fml_svi, data = d_svi)
-  ols_ice <- stats::lm(fml, data = mod_data2)   
-  svi_sens <- list(
-    ols_svi = ols_svi, ols_ice_ref = ols_ice,
-    n_svi   = nrow(d_svi),
-    aging_env_svi = broom::tidy(ols_svi) |>
-      dplyr::filter(grepl("pct_age_65_plus:", term)),
-    aging_env_ice = broom::tidy(ols_ice) |>
-      dplyr::filter(grepl("pct_age_65_plus:", term))
-  )
-  saveRDS(svi_sens, f_svi_sens)
-  cat("  n (SVI specification): ", nrow(d_svi), "\n", sep = "")
-  cat("  Aging × env interactions — ICE-based (primary) ─────────\n")
-  print(svi_sens$aging_env_ice |>
-          dplyr::transmute(term, est = round(estimate, 5),
-                           se = round(std.error, 5),
-                           p = round(p.value, 4)))
-  cat("\n  Aging × env interactions — SVI-based (sensitivity) ─────\n")
-  print(svi_sens$aging_env_svi |>
-          dplyr::transmute(term, est = round(estimate, 5),
-                           se = round(std.error, 5),
-                           p = round(p.value, 4)))
-  readr::write_csv(
-    dplyr::bind_rows(
-      dplyr::mutate(svi_sens$aging_env_ice, spec = "ICE (primary)"),
-      dplyr::mutate(svi_sens$aging_env_svi, spec = "SVI (sensitivity)")),
-    file.path(dir_tbl, "08_svi_sensitivity.csv"))
-  cat("  saved: ", file.path(dir_tbl, "08_svi_sensitivity.csv"), "\n")
-} else if (have_svi) {
-  message("  SVI sensitivity: cached.")
-} else {
-  message("  SVI sensitivity: skipped (SVI columns not in mod_data2 — ",
-          "download SVI 2020 CSV to data/raw/ to enable).")
-}
 
 
 # ---- 8e. CKD-excluded (4-indicator) CKM index sensitivity -------
@@ -5453,89 +3584,6 @@ if (!exists("build_index") || !exists("analytic")) {
 }
 
 
-# ---- 8f. Standardized (per-SD / per-IQR) effect sizes ------------
-
-
-cat("\n---- 8f. Standardized (per-SD / per-IQR) effect sizes ----\n")
-
-
-.std_frame <- mod_data2
-.std_frame$.idarea <- match(.std_frame$GEOID, mod_geo$GEOID)
-.std_frame <- dplyr::filter(.std_frame, !is.na(.idarea))
-
-.scale_for <- function(term, dat, what = c("SD", "IQR")) {
-  what  <- match.arg(what)
-  fun   <- if (what == "SD") stats::sd else stats::IQR
-  parts <- strsplit(term, ":", fixed = TRUE)[[1]]
-  fac   <- 1
-  types <- character(0)
-  for (p in parts) {
-    if (!p %in% names(dat) || !is.numeric(dat[[p]])) {
-      types <- c(types, "unit"); next
-    }
-    v <- dat[[p]]
-    u <- unique(v[!is.na(v)])
-    if (length(u) <= 2 && all(u %in% c(0, 1))) {
-      types <- c(types, "0->1"); next
-    }
-    fac   <- fac * fun(v, na.rm = TRUE)
-    types <- c(types, what)
-  }
-  list(factor = fac, type = paste(types, collapse = " x "))
-}
-
-.standardize <- function(sf, dat, label, outcome) {
-  y_sd <- stats::sd(dat[[outcome]], na.rm = TRUE)
-  d    <- tibble::as_tibble(sf, rownames = "predictor")
-  d    <- d[d$predictor != "(Intercept)", , drop = FALSE]
-  sdi  <- lapply(d$predictor, .scale_for, dat = dat, what = "SD")
-  iqi  <- lapply(d$predictor, .scale_for, dat = dat, what = "IQR")
-  sd_f <- vapply(sdi, `[[`, numeric(1),   "factor")
-  typ  <- vapply(sdi, `[[`, character(1), "type")
-  iq_f <- vapply(iqi, `[[`, numeric(1),   "factor")
-  tibble::tibble(
-    model          = label,
-    predictor      = d$predictor,
-    raw_mean       = d$mean,
-    raw_lower      = d$`0.025quant`,
-    raw_upper      = d$`0.975quant`,
-    scale_type     = typ,
-    sd_factor      = sd_f,
-    iqr_factor     = iq_f,
-    per_sd_mean    = d$mean         * sd_f,
-    per_sd_lower   = d$`0.025quant` * sd_f,
-    per_sd_upper   = d$`0.975quant` * sd_f,
-    per_iqr_mean   = d$mean         * iq_f,
-    pct_outcome_sd = 100 * d$mean * sd_f / y_sd)
-}
-
-std_tbl <- .standardize(bym2_save$summary_fixed, .std_frame,
-                        "Model 2 (fully adjusted)", "ckm_core_pca")
-if (exists("bym2_nb_save") && !is.null(bym2_nb_save))
-  std_tbl <- dplyr::bind_rows(
-    .standardize(bym2_nb_save$summary_fixed, .std_frame,
-                 "Model 1 (behavioral block excluded)", "ckm_core_pca"),
-    std_tbl)
-
-readr::write_csv(std_tbl, file.path(dir_tbl, "08_standardized_effects.csv"))
-cat("  n (estimation frame): ", nrow(.std_frame), "\n", sep = "")
-cat("  outcome SD:           ",
-    sprintf("%.4f", stats::sd(.std_frame$ckm_core_pca, na.rm = TRUE)),
-    "\n", sep = "")
-cat("  saved: ", file.path(dir_tbl, "08_standardized_effects.csv"), "\n")
-
-.preview_model <- if ("Model 1 (behavioral block excluded)" %in% std_tbl$model)
-  "Model 1 (behavioral block excluded)" else std_tbl$model[1]
-cat("  top predictors, ", .preview_model, ":\n", sep = "")
-print(std_tbl |>
-        dplyr::filter(model == .preview_model) |>
-        dplyr::arrange(dplyr::desc(abs(pct_outcome_sd))) |>
-        dplyr::transmute(predictor,
-                         per_sd   = round(per_sd_mean, 4),
-                         pct_outSD = round(pct_outcome_sd, 1)) |>
-        head(12))
-
-
 # ---- 8g. South-minus-non-South decomposition of the Model 2 predictor ----
  
 
@@ -5657,159 +3705,21 @@ if (!exists("bym2_save") || is.null(bym2_save) ||
 # ==============================================================
 
 # Outputs:
-#   output/figures/09_forest_bym2.png         — main effects + CrIs, Model 2
-#                                               (comparator view)
-#   output/figures/09_forest_bym2_primary.png  — Model 1 forest, single-
-#                                               specification view
-#   output/figures/09_dumbbell_bym2_m1_m2.png  — manuscript dumbbell figure: Model 1 vs
+#   output/figures/09_dumbbell_bym2_m1_m2.png  — article dumbbell figure: Model 1 vs
 #                                               Model 2, paired by predictor
-#   output/figures/09_residual_moran_progression.png
-#   output/tables/09_main_results_table.csv   — combined OLS|ESF|BYM2|SHAP
 #   output/tables/09_table3_bym2.csv          — BYM2 Model 2 coefficients; these
 #                                               are the Model 2 column of the
-#                                               manuscript BYM2 coefficient table
-#   output/tables/09_tableS7_ols_esf.csv      — manuscript OLS/ESF table
+#                                               article BYM2 coefficient table
+#   output/tables/09_tableS7_ols_esf.csv      — article OLS/ESF table
 
 cat("\n========================================================\n")
-cat("Section 9 — Manuscript figures + tables\n")
+cat("Section 9: figures and tables\n")
 cat("========================================================\n")
 
-# ---- 9a. Forest plot of BYM2 95% CrIs ---------------------------
+# ---- 9a. Cached Model 2 BYM2 fit (used by 9d) -------------
 bym2_save <- readRDS(file.path(dir_proc, "06_inla_bym2.rds"))
-forest_df <- tibble::as_tibble(bym2_save$summary_fixed,
-                                rownames = "predictor") |>
-  dplyr::filter(!predictor %in% c("(Intercept)", "island")) |>
-  dplyr::mutate(
-    block = dplyr::case_when(
-      grepl(":", predictor)                                ~ "Aging × Env",
-      predictor %in% c("pm25_annual", "o3_8hrmax_4thmax",
-                       "LILATracts_1And10", "tmax_warm",
-                       "walk_index")                        ~ "Environment",
-      predictor %in% c("CSMOKING", "LPA", "ACCESS2",
-                       "CHECKUP")                          ~ "Behavioral",
-      grepl("^ruca", predictor) | predictor %in%
-        c("ice_race", "ice_income", "pct_bachelor_plus",
-          "median_income", "pct_hispanic")                 ~ "SDOH",
-      TRUE                                                  ~ "Demography"
-    ),
-    block = factor(block, levels = c("Aging × Env", "Environment",
-                                      "SDOH", "Behavioral", "Demography"))
-  ) |>
-  dplyr::arrange(block, mean) |>
-  dplyr::mutate(predictor = factor(predictor, levels = predictor))
 
-p_forest <- ggplot(forest_df,
-                   aes(x = mean, y = predictor, colour = block)) +
-  geom_vline(xintercept = 0, colour = "grey50", linetype = "dashed") +
-  geom_errorbar(aes(xmin = `0.025quant`, xmax = `0.975quant`),
-                width = 0, linewidth = 0.6, orientation = "y") +
-  geom_point(size = 2.4) +
-  scale_y_discrete(labels = .label_pred) +
-  scale_colour_manual(values = c("Aging × Env" = "#B2182B",
-                                  "Environment" = "#FD8D3C",
-                                  "SDOH"        = "#2166AC",
-                                  "Behavioral"  = "#9970AB",
-                                  "Demography"  = "#5AAE61")) +
-  facet_wrap(~ block, ncol = 1, scales = "free", strip.position = "top") +
-  labs(
-    x = "Posterior mean coefficient (95% credible interval)",
-    y = NULL,
-    colour = NULL,
-    title    = "Adjusted associations of SDOH and environmental exposures with CKM burden",
-    subtitle = paste0("Bayesian hierarchical spatial regression (INLA BYM2). ",
-                      "Vertical reference line at 0 = no association."),
-    caption  = paste0("N = ", formatC(bym2_save$n, big.mark = ","),
-                      " tracts.  DIC = ", round(bym2_save$dic, 0),
-                      ".  Each panel uses an independent x-axis scale because",
-                      " effect-size magnitudes differ by predictor block.")
-  ) +
-  theme_ckm +
-  theme(legend.position = "none",
-        strip.text = element_text(face = "bold", size = 11),
-        strip.background = element_rect(fill = "grey92", colour = NA),
-        panel.spacing.y = unit(0.8, "lines"),
-        plot.title = element_text(face = "bold"),
-        plot.caption = element_text(size = 8, colour = "grey40",
-                                     hjust = 0, lineheight = 1.1),
-        plot.margin = margin(8, 14, 8, 8))
-ggsave(file.path(dir_fig, "09_forest_bym2.png"),
-       p_forest, width = 12, height = 9, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "09_forest_bym2.png"), "\n")
-
-# ---- 9a2. Forest plot of the PRIMARY specification (Model 1) ----
-
-forest2_df <- readr::read_csv(
-    file.path(dir_tbl, "06_6g_coefficients_bym2_nobehav.csv"),
-    show_col_types = FALSE) |>
-  dplyr::filter(!predictor %in% c("(Intercept)", "island")) |>
-  dplyr::mutate(
-    block = dplyr::case_when(
-      grepl(":", predictor)                                ~ "Aging × Env",
-      predictor %in% c("pm25_annual", "o3_8hrmax_4thmax",
-                       "LILATracts_1And10", "tmax_warm",
-                       "walk_index")                        ~ "Environment",
-      grepl("^ruca", predictor) | predictor %in%
-        c("ice_race", "ice_income", "pct_bachelor_plus",
-          "median_income", "pct_hispanic")                 ~ "SDOH",
-      TRUE                                                  ~ "Demography"
-    ),
-    block = factor(block, levels = c("Aging × Env", "Environment",
-                                      "SDOH", "Demography"))
-  ) |>
-  dplyr::arrange(block, mean) |>
-  dplyr::mutate(predictor = factor(predictor, levels = predictor))
-
-
-stopifnot(!any(c("CSMOKING", "LPA", "ACCESS2", "CHECKUP") %in%
-                 as.character(forest2_df$predictor)))
-stopifnot(nrow(forest2_df) == 18L)
-
-fit2 <- readr::read_csv(file.path(dir_tbl, "06_6g_fit_nobehav.csv"),
-                        show_col_types = FALSE)
-
-p_forest2 <- ggplot(forest2_df,
-                    aes(x = mean, y = predictor, colour = block)) +
-  geom_vline(xintercept = 0, colour = "grey50", linetype = "dashed") +
-  geom_errorbar(aes(xmin = `0.025quant`, xmax = `0.975quant`),
-                width = 0, linewidth = 0.6, orientation = "y") +
-  geom_point(size = 2.4) +
-  scale_y_discrete(labels = .label_pred) +
-  scale_colour_manual(values = c("Aging × Env" = "#B2182B",
-                                  "Environment" = "#FD8D3C",
-                                  "SDOH"        = "#2166AC",
-                                  "Demography"  = "#5AAE61")) +
-  facet_wrap(~ block, ncol = 1, scales = "free", strip.position = "top") +
-  labs(
-    x = "Posterior mean coefficient (95% credible interval)",
-    y = NULL,
-    colour = NULL,
-    title    = "Adjusted associations of SDOH and environmental exposures with CKM burden",
-
-    subtitle = paste0("Bayesian hierarchical spatial regression (INLA BYM2), ",
-                      "behavior-excluded primary specification (Model 1).\n",
-                      "Vertical reference line at 0 = no association."),
-
-    caption  = paste0("N = ", formatC(as.integer(fit2$n[1]),
-                                       format = "d", big.mark = ","),
-                      " tracts.  DIC = ", formatC(as.integer(round(fit2$dic[1], 0)),
-                                                   format = "d", big.mark = ","),
-                      ".  Each panel uses an independent x-axis scale because",
-                      " effect-size magnitudes differ by predictor block.")
-  ) +
-  theme_ckm +
-  theme(legend.position = "none",
-        strip.text = element_text(face = "bold", size = 11),
-        strip.background = element_rect(fill = "grey92", colour = NA),
-        panel.spacing.y = unit(0.8, "lines"),
-        plot.title = element_text(face = "bold"),
-        plot.caption = element_text(size = 8, colour = "grey40",
-                                     hjust = 0, lineheight = 1.1),
-        plot.margin = margin(8, 14, 8, 8))
-
-ggsave(file.path(dir_fig, "09_forest_bym2_primary.png"),
-       p_forest2, width = 12, height = 9, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "09_forest_bym2_primary.png"),
-    "  (Model 1 forest; single-specification view, not a manuscript figure)\n")
+# ---- 9a2. Dumbbell plot: Model 1 vs Model 2 --------------------
 
 m1_dumb <- readr::read_csv(
     file.path(dir_tbl, "06_6g_coefficients_bym2_nobehav.csv"),
@@ -5904,65 +3814,10 @@ gt_dumb$heights[dumb_prow] <- grid::unit(dumb_nrow, "null")
 ggsave(file.path(dir_fig, "09_dumbbell_bym2_m1_m2.png"), gt_dumb,
        width = 12, height = 8.2, dpi = 220, bg = "white")
 cat("  saved: ", file.path(dir_fig, "09_dumbbell_bym2_m1_m2.png"),
-    "  (manuscript dumbbell figure)\n")
+    "  (dumbbell figure)\n")
 
 
-# ---- 9b. Residual Moran's I progression bar chart --------------
-# Residual Moran's I progression: baseline OLS, full-covariate OLS, and ESF on the full covariate set,
-# so the ESF bar has its matched OLS comparator (29_residual_moran_full_ols.csv).
-mi_prog <- readr::read_csv(
-  file.path(dir_tbl, "29_residual_moran_full_ols.csv"),
-  show_col_types = FALSE) |>
-  dplyr::mutate(model = factor(c("Baseline OLS\n(demographic + socioeconomic)",
-                                 "OLS\n(full covariate set)", "ESF\n(full covariate set)"),
-                               levels = c("Baseline OLS\n(demographic + socioeconomic)",
-                                          "OLS\n(full covariate set)", "ESF\n(full covariate set)")))
-p_mi <- ggplot(mi_prog,
-               aes(x = model, y = moran_I)) +
-  geom_col(fill = "#FD8D3C") +
-  geom_text(aes(label = sprintf("%.3f", moran_I)),
-            vjust = -0.4, size = 3.5) +
-  labs(x = NULL, y = "Residual Moran's I",
-       title = "Residual spatial autocorrelation by model",
-       subtitle = sprintf("On the full covariate set, ESF reduces residual I from %.3f to %.3f",
-                          mi_prog$moran_I[2], mi_prog$moran_I[3])) +
-  theme_ckm
-ggsave(file.path(dir_fig, "09_residual_moran_progression.png"),
-       p_mi, width = 7, height = 4.5, dpi = 220, bg = "white")
-cat("  saved: ", file.path(dir_fig, "09_residual_moran_progression.png"), "\n")
-
-# ---- 9c. Combined main-results table (OLS | ESF | BYM2 | SHAP) -
-
-ols_coefs  <- readr::read_csv(file.path(dir_tbl, "06_coefficient_comparison.csv"),
-                              show_col_types = FALSE) |>
-  dplyr::transmute(predictor,
-                   ols_estimate = round(ols_estimate, 4),
-                   ols_se       = signif(ols_se, 3),
-                   ols_p        = signif(ols_p, 3))
-esf_coefs  <- readr::read_csv(file.path(dir_tbl, "06_coefficients_esf.csv"),
-                              show_col_types = FALSE) |>
-  dplyr::transmute(predictor,
-                   esf_estimate = round(Estimate, 4),
-                   esf_p        = signif(p_value, 3))
-bym2_coefs <- tibble::as_tibble(bym2_save$summary_fixed,
-                                 rownames = "predictor") |>
-  dplyr::transmute(predictor,
-                   bym2_mean = round(mean, 4),
-                   bym2_2.5  = round(`0.025quant`, 4),
-                   bym2_97.5 = round(`0.975quant`, 4))
-shap_rank  <- readr::read_csv(file.path(dir_tbl, "07_shap_global.csv"),
-                              show_col_types = FALSE) |>
-  dplyr::transmute(predictor = feature, shap_rank = rank,
-                   shap_pct  = pct_total)
-
-main_results <- ols_coefs |>
-  dplyr::full_join(esf_coefs,  by = "predictor") |>
-  dplyr::full_join(bym2_coefs, by = "predictor") |>
-  dplyr::full_join(shap_rank,  by = "predictor")
-readr::write_csv(main_results, file.path(dir_tbl, "09_main_results_table.csv"))
-cat("  saved: ", file.path(dir_tbl, "09_main_results_table.csv"), "\n")
-
-# ---- 9d. Split into the BYM2 export and the manuscript OLS/ESF table --------
+# ---- 9d. Split into the BYM2 export and the article OLS/ESF table --------
 
 
 .pred_label <- c(
@@ -5993,21 +3848,21 @@ cat("  saved: ", file.path(dir_tbl, "09_main_results_table.csv"), "\n")
 
 .label_check <- function(x) {
   miss <- setdiff(x, names(.pred_label))
-  if (length(miss)) warning("No manuscript label for predictor(s): ",
+  if (length(miss)) warning("No display label for predictor(s): ",
                             paste(miss, collapse = ", "), call. = FALSE)
   ifelse(x %in% names(.pred_label), unname(.pred_label[x]), x)
 }
 
-tbl3_manuscript <- tibble::as_tibble(bym2_save$summary_fixed,
+tbl3_out <- tibble::as_tibble(bym2_save$summary_fixed,
                                      rownames = "predictor") |>
   dplyr::transmute(Predictor             = .label_check(predictor),
                    `BYM2 posterior mean` = mean,
                    `95% CrI lower`       = `0.025quant`,
                    `95% CrI upper`       = `0.975quant`)
-readr::write_csv(tbl3_manuscript, file.path(dir_tbl, "09_table3_bym2.csv"))
+readr::write_csv(tbl3_out, file.path(dir_tbl, "09_table3_bym2.csv"))
 cat("  saved: ", file.path(dir_tbl, "09_table3_bym2.csv"), "\n")
 
-tblS7_manuscript <- readr::read_csv(
+tbl_ols_esf_out <- readr::read_csv(
     file.path(dir_tbl, "06_coefficient_comparison.csv"), show_col_types = FALSE) |>
   dplyr::filter(!is.na(ols_estimate)) |>
   dplyr::transmute(Predictor = .label_check(predictor),
@@ -6016,14 +3871,14 @@ tblS7_manuscript <- readr::read_csv(
                    `OLS p`  = ols_p,
                    `ESF β`  = esf_estimate,
                    `ESF p`  = esf_p)
-readr::write_csv(tblS7_manuscript, file.path(dir_tbl, "09_tableS7_ols_esf.csv"))
+readr::write_csv(tbl_ols_esf_out, file.path(dir_tbl, "09_tableS7_ols_esf.csv"))
 cat("  saved: ", file.path(dir_tbl, "09_tableS7_ols_esf.csv"), "\n")
 
 cat("\n=== Section 9 complete. ===\n")
-cat("  Manuscript-ready outputs assembled at:\n")
+cat("  Outputs assembled at:\n")
 cat("    figures: ", dir_fig, "\n")
 cat("    tables:  ", dir_tbl, "\n")
-cat("\n  Manuscript figure files: see the Manuscript figures table in README.md\n")
+cat("\n  Figure files: see the figure table in README.md\n")
 
 # ==============================================================
 # 10.  POST-PIPELINE ANALYSES
@@ -6348,7 +4203,7 @@ stopifnot(is.function(get("ckm_sample", .ckm_env)))
   message("weights confirmed applied: weighted and unweighted fits differ")
 
   # ---------------------------------------------------------------------------
-  # 6a. Validation: does the unweighted refit reproduce the published primary?
+  # 6a. Validation: does the unweighted refit reproduce the primary fit?
   # ---------------------------------------------------------------------------
   pf <- prim$summary_fixed
   uf <- fit_u$summary.fixed
@@ -6359,7 +4214,7 @@ stopifnot(is.function(get("ckm_sample", .ckm_env)))
     Refit       = uf[shared, "mean"],
     Abs_diff    = uf[shared, "mean"] - pf[shared, "mean"],
     row.names = NULL)
-  message("\n--- Validation: unweighted refit vs published primary fit ---")
+  message("\n--- Validation: unweighted refit vs primary fit ---")
   print(val, digits = 4, row.names = FALSE)
   message(sprintf("max |diff| = %.5f   r = %.5f",
                   max(abs(val$Abs_diff)), cor(val$Published, val$Refit)))
@@ -6425,7 +4280,7 @@ environment(.stage) <- new.env(parent = globalenv())
   # INPUTS   data/processed/02_ckm_index.rds
   #          data/processed/01_tracts_geo.rds
   #          data/processed/06_inla_bym2.rds                  (for the n check)
-  #          output/tables/06_6g_coefficients_bym2_nobehav.csv (published Model 1)
+  #          output/tables/06_6g_coefficients_bym2_nobehav.csv (Model 1 fit)
   #          data/raw/PLACES__..._2022_release_20260311.csv
   # OUTPUTS  data/processed/09b_precision_weighted_model2.rds
   #          output/tables/09b_precision_weighted_model2_sensitivity.csv
@@ -6635,7 +4490,7 @@ environment(.stage) <- new.env(parent = globalenv())
   message("weights confirmed applied: weighted and unweighted fits differ")
 
   # ---------------------------------------------------------------------------
-  # 6a. Validation: does the unweighted refit reproduce the published Model 1?
+  # 6a. Validation: does the unweighted refit reproduce the primary Model 1 fit?
   # ---------------------------------------------------------------------------
   pub <- read.csv(file.path(dir_tab, "06_6g_coefficients_bym2_nobehav.csv"),
                   check.names = FALSE, stringsAsFactors = FALSE)
@@ -6649,7 +4504,7 @@ environment(.stage) <- new.env(parent = globalenv())
     Refit     = uf[shared, "mean"],
     row.names = NULL)
   val$Abs_diff <- val$Refit - val$Published
-  message("\n--- Validation: unweighted Model 1 refit vs published Model 1 fit ---")
+  message("\n--- Validation: unweighted Model 1 refit vs primary Model 1 fit ---")
   print(val, digits = 6, row.names = FALSE)
   message(sprintf("max |diff| = %.6f   r = %.6f",
                   max(abs(val$Abs_diff)), cor(val$Published, val$Refit)))
@@ -6962,13 +4817,13 @@ environment(.stage) <- new.env(parent = globalenv())
       bad <- chk[abs(chk$refit - chk$county_estimate) > 1e-4, ]
       if (nrow(bad)) {
         print(bad)
-        stop("Reconstruction does not reproduce the published unweighted fit; ",
+        stop("Reconstruction does not reproduce the saved unweighted fit; ",
              "refusing to overwrite outputs.")
       }
       message("provenance guard PASSED: reproduced all ", nrow(chk),
-              " published coefficients to 4 dp")
+              " saved coefficients to 4 dp")
     } else {
-      message("published CSV already carries weighted and unweighted columns; guard skipped")
+      message("saved CSV already carries weighted and unweighted columns; guard skipped")
     }
   }
 
@@ -7044,8 +4899,8 @@ environment(.stage) <- new.env(parent = globalenv())
   # OUTPUTS
   #   data/processed/12_bym2_refit_model1.rds   full summaries incl. fitted+hyper
   #   data/processed/12_bym2_refit_model2.rds
-  #   output/tables/12_bym2_posterior_residual.csv     manuscript-facing numbers
-  #   output/tables/12_bym2_refit_validation.csv       refit vs published
+  #   output/tables/12_bym2_posterior_residual.csv     reported numbers
+  #   output/tables/12_bym2_refit_validation.csv       refit vs primary fit
   #   output/logs/12_bym2_posterior_residual.log       captured console output
   #
 
@@ -7158,7 +5013,7 @@ environment(.stage) <- new.env(parent = globalenv())
   }
 
   # ---------------------------------------------------------------------------
-  # 4. Validate the refit against the published fit 
+  # 4. Validate the refit against the primary fit 
   # ---------------------------------------------------------------------------
   TOL <- 0.1   # gate in posterior SDs of the reference fit
   validate <- function(label, fit, published) {
@@ -7171,11 +5026,11 @@ environment(.stage) <- new.env(parent = globalenv())
                     abs_diff = rf[sh, "mean"] - pf[sh, "mean"],
                     row.names = NULL)
     mx <- max(abs(v$abs_diff) / pf[sh, "sd"])
-    message(sprintf("--- %s: refit vs published, max |diff|/SD = %.3g, r = %.6f ---",
+    message(sprintf("--- %s: refit vs primary fit, max |diff|/SD = %.3g, r = %.6f ---",
                     label, mx, cor(v$published, v$refit)))
     print(v[order(-abs(v$abs_diff)), ], digits = 5, row.names = FALSE)
     if (mx > TOL)
-      stop(sprintf(paste("%s refit does NOT reproduce the published fit",
+      stop(sprintf(paste("%s refit does NOT reproduce the primary fit",
                          "(max |diff|/SD = %.4g > %.4g). Refusing to report",
                          "derived quantities."), label, mx, TOL), call. = FALSE)
     v
@@ -7326,428 +5181,6 @@ environment(.stage) <- new.env(parent = globalenv())
 environment(.stage) <- new.env(parent = globalenv())
 .run_stage("12_bym2_posterior_residual.R", .stage)
 
-# ---- stage: 13_residual_effect_map.R ----
-.stage <- function() {
-  
-
-
-  suppressPackageStartupMessages({
-    library(sf); library(dplyr); library(ggplot2); library(stringr)
-    library(tigris); library(patchwork); library(scales)
-  })
-  options(tigris_use_cache = TRUE)
-  sf::sf_use_s2(FALSE)
-
-
-  ROOT <- getwd()
-  if (!dir.exists(file.path(ROOT, "data")) &&
-      dir.exists(file.path(ROOT, "..", "data"))) ROOT <- normalizePath(file.path(ROOT, ".."))
-  stopifnot(dir.exists(file.path(ROOT, "data", "processed")))
-  dir_proc <- file.path(ROOT, "data/processed")
-  dir_fig  <- file.path(ROOT, "output/figures")
-  OUT      <- file.path(dir_fig, "06h_bym2_spatial_random_effect_2panel.png")
-
-  TIGRIS_YEAR     <- 2019
-  NJ_UNAVAIL_FILL <- "grey60"
-  LEGEND          <- "Spatial\nrandom effect\n(PC1 score units)"
-
-
-  TARGET_W <- 2860L
-  TARGET_H <- 1232L
-
-  stopifnot(!grepl("SD units", LEGEND))
-
-  # ---- 1. cached published fits ------------------------------------------------
-  f_adj <- file.path(dir_proc, "06_inla_bym2.rds")            # Model 2
-  f_exc <- file.path(dir_proc, "06_6g_inla_bym2_nobehav.rds") # Model 1
-  stopifnot(file.exists(f_adj), file.exists(f_exc))
-  bym2_save    <- readRDS(f_adj)
-  bym2_nb_save <- readRDS(f_exc)
-
-  # ---- 2. GEOID vector in the CACHED fits' node order --------------------------
- 
-  # 3.3 Southern mean from +0.297 to +0.167; the checks in step 3 catch that.
-  r1 <- readRDS(file.path(dir_proc, "12_bym2_refit_model1.rds"))
-  r2 <- readRDS(file.path(dir_proc, "12_bym2_refit_model2.rds"))
-  stopifnot(identical(r1$GEOID, r2$GEOID))
-
-  tracts_geo <- readRDS(file.path(dir_proc, "01_tracts_geo.rds"))
-  tg <- str_trim(enc2utf8(as.character(st_drop_geometry(tracts_geo)$GEOID)))
-  stopifnot(!anyDuplicated(tg))
-  GEO <- tg[tg %in% r1$GEOID]
-  N   <- length(GEO)
-  stopifnot(N == 69530, !anyDuplicated(GEO), setequal(GEO, r1$GEOID))
-  
-  stopifnot(!identical(GEO, r1$GEOID))
-
- 
-  re_mean <- function(sv) {
-    rd <- as.data.frame(sv$summary_random)
-    stopifnot(nrow(rd) == 2 * N)
-    head(rd$mean, N)
-  }
-  m_exc <- re_mean(bym2_nb_save)   # Model 1
-  m_adj <- re_mean(bym2_save)      # Model 2
-
-  # ---- 3. PROVE the pairing against the numbers the Results quote -------------
-  SOUTH <- c("01","05","10","11","12","13","21","22","24",
-             "28","37","40","45","47","48","51","54")
-  chk <- function(mv, label, exp_s, exp_n, exp_p) {
-    iss <- substr(GEO, 1, 2) %in% SOUTH
-    s <- round(mean(mv[iss]), 3); n <- round(mean(mv[!iss]), 3)
-    p <- round(100 * mean(mv[iss] > 0), 1)
-    cat(sprintf("%-8s South %+.3f (pub %+.3f) | non-South %+.3f (pub %+.3f) | %%pos %.1f (pub %.1f)\n",
-                label, s, exp_s, n, exp_n, p, exp_p))
-    stopifnot(s == exp_s, n == exp_n, p == exp_p)
-  }
-  chk(m_exc, "Model 1", 0.322, -0.191, 64.6)
-  chk(m_adj, "Model 2", -0.042, 0.025, 40.2)
-
- 
-  st <- tapply(m_exc, substr(GEO, 1, 2), mean)
-  top6 <- head(sort(st, decreasing = TRUE), 6)
-  cat("top 6 state means (Model 1):",
-      paste(sprintf("%s %+.2f", names(top6), top6), collapse = "  "), "\n")
-  stopifnot(identical(names(top6), c("54","21","01","40","47","05")),
-            all(round(unname(top6), 2) == c(1.53, 1.28, 0.94, 0.90, 0.79, 0.78)),
-            all(names(top6) %in% SOUTH))
-  cat("PAIRING VERIFIED: cached fits + refit GEOID reproduce the quoted Results exactly\n\n")
-
-  # ---- 4. geometry -------------------------------------------------------------
-  .re_geo_of <- function(mv) {
-    rd <- data.frame(GEOID = GEO, mean = mv, stringsAsFactors = FALSE)
-    tracts_geo |>
-      mutate(GEOID = str_trim(enc2utf8(as.character(GEOID)))) |>
-      inner_join(rd |> mutate(GEOID = str_trim(enc2utf8(GEOID))), by = "GEOID") |>
-      filter(!substr(GEOID, 1, 2) %in% c("60","66","69","72","78"), ALAND > 0) |>
-      st_transform(4326) |>
-      tigris::shift_geometry(geoid_column = "GEOID",
-                             preserve_area = FALSE, position = "below")
-  }
-  re_exc <- .re_geo_of(m_exc)
-  re_adj <- .re_geo_of(m_adj)
-  cat(sprintf("joined tracts: Model 1 %d, Model 2 %d (of %d)\n",
-              nrow(re_exc), nrow(re_adj), N))
-  stopifnot(nrow(re_exc) == nrow(re_adj), nrow(re_exc) > 0.99 * N)
-
-  nj_unavail <- tracts_geo |>
-    mutate(GEOID = str_trim(enc2utf8(as.character(GEOID)))) |>
-    filter(substr(GEOID, 1, 2) == "34", ALAND > 0) |>
-    st_transform(4326) |>
-    tigris::shift_geometry(geoid_column = "GEOID",
-                           preserve_area = FALSE, position = "below")
-
-  states_conus <- tigris::states(cb = TRUE, year = TIGRIS_YEAR,
-                                 progress_bar = FALSE) |>
-    filter(!STATEFP %in% c("60","66","69","72","78")) |>
-    tigris::shift_geometry(preserve_area = FALSE, position = "below") |>
-    filter(!STATEFP %in% c("02","15"))
-
-  # ---- 5. draw (verbatim from CKM_US_Main.R 6.7b, legend string excepted) ------
-  re_lim2 <- max(abs(quantile(re_adj$mean, c(0.02, 0.98), na.rm = TRUE)),
-                 abs(quantile(re_exc$mean, c(0.02, 0.98), na.rm = TRUE)))
-  cat(sprintf("colour limit re_lim2 = %.6f\n", re_lim2))
-
-  .bym2_panel <- function(d, tag, ttl, sub) {
-    ggplot() +
-      geom_sf(data = d, aes(fill = mean), colour = NA) +
-      geom_sf(data = nj_unavail, fill = NJ_UNAVAIL_FILL, colour = NA) +
-      geom_sf(data = states_conus, fill = NA, colour = "grey25", linewidth = 0.25) +
-      scale_fill_gradient2(
-        low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
-        limits = c(-re_lim2, re_lim2), oob = scales::squish,
-        name = LEGEND) +
-      coord_sf(datum = NA) +
-      theme_void(base_size = 19) +
-      theme(plot.title    = element_text(face = "bold", size = 19),
-            plot.subtitle = element_text(colour = "grey30", size = 14),
-            plot.tag      = element_text(face = "bold", size = 22),
-            legend.title  = element_text(size = 17),
-            legend.text   = element_text(size = 15)) +
-      labs(tag = tag, title = ttl, subtitle = sub)
-  }
-
-  p_fig6 <- patchwork::wrap_plots(
-    .bym2_panel(re_exc, "A", "Model 1 - behavior-excluded",
-                "Behavioral/healthcare-engagement block removed"),
-    .bym2_panel(re_adj, "B", "Model 2 - behavior-adjusted",
-                "Behavioral/healthcare-engagement block included"),
-    nrow = 1, guides = "collect")
-
-  ggsave(OUT, p_fig6, width = 13, height = 5.6, dpi = 220, bg = "white")
-
-  # ---- 6. the PNG must drop into the existing <wp:extent> unchanged ------------
-  d <- readBin(OUT, "raw", 40)
-  stopifnot(identical(as.integer(d[1:8]), c(137L,80L,78L,71L,13L,10L,26L,10L)))
-  rdint <- function(b) sum(as.integer(b) * 256^(3:0))
-  w <- rdint(d[17:20]); h <- rdint(d[21:24])
-  cat(sprintf("wrote %s : %d x %d px\n", basename(OUT), w, h))
-  stopifnot(w == TARGET_W, h == TARGET_H)
-  cat("Residual spatial-effect map drawn; pixel dimensions match the embedded image.\n")
-
-}
-environment(.stage) <- new.env(parent = globalenv())
-.run_stage("13_residual_effect_map.R", .stage)
-
-# ---- stage: 14_interaction_figure.R ----
-.stage <- function() {
-  # =============================================================================
-  # 14_interaction_figure.R 
-
-
-  suppressPackageStartupMessages({
-    library(sf); library(dplyr); library(tidyr); library(tibble)
-    library(purrr); library(ggplot2); library(patchwork); library(readr)
-  })
-
-
-  ROOT <- getwd()
-  if (!dir.exists(file.path(ROOT, "data")) &&
-      dir.exists(file.path(ROOT, "..", "data"))) ROOT <- normalizePath(file.path(ROOT, ".."))
-  stopifnot(dir.exists(file.path(ROOT, "data", "processed")))
-  dir_proc <- file.path(ROOT, "data/processed")
-  dir_fig  <- file.path(ROOT, "output/figures")
-  dir_tbl  <- file.path(ROOT, "output/tables")
-
-  F_PNG  <- file.path(dir_fig, "07_age_env_interactions.png")
-  F_CSV  <- file.path(dir_tbl, "07_age_env_interaction_loess.csv")
-  WRITE  <- "--write" %in% commandArgs(trailingOnly = TRUE)
-
-  ENV_PRED <- c("pm25_annual", "o3_8hrmax_4thmax", "LILATracts_1And10",
-                "tmax_warm", "walk_index")
-
-
-  predictor_pretty <- c(
-    pct_age_65_plus     = "% adults age 65+",
-    pct_bachelor_plus   = "% adults with bachelor's+",
-    pct_hispanic        = "% Hispanic",
-    ice_income          = "ICE Income",
-    ice_race            = "ICE Race",
-    pm25_annual         = "Annual mean PM₂.₅ (µg/m³)",
-    o3_8hrmax_4thmax    = "Annual 4th-highest 8-hr O₃ (per 10 ppb)",
-    tmax_warm           = "Warm-season (May–Sep) max temp (°C)",
-    walk_index          = "EPA National Walkability Index (1–20)",
-    LILATracts_1And10   = "Low-income low-access tract (1-mi/10-mi)")
-
-
-  fig8_pretty <- c(predictor_pretty,
-                   o3_8hrmax_4thmax = "Annual 4th-highest 8-hr O₃ (ppb)")
-  fig8_pretty <- fig8_pretty[!duplicated(names(fig8_pretty), fromLast = TRUE)]
-  stopifnot(fig8_pretty[["o3_8hrmax_4thmax"]] ==
-              "Annual 4th-highest 8-hr O₃ (ppb)")
-  .label_fig8 <- function(x) unname(fig8_pretty[as.character(x)])
-
-  theme_ckm <- theme_bw(base_size = 11) +
-    theme(strip.background = element_rect(fill = "grey92"),
-          panel.grid.minor = element_blank(),
-          legend.position  = "bottom")
-
-  # ---------------------------------------------------------------------------
-  # 1. The cached TreeSHAP matrix -- the published one, not a recomputation
-  # ---------------------------------------------------------------------------
-  shap_obj <- readRDS(file.path(dir_proc, "07_shap.rds"))
-  shap_vals <- shap_obj$shap
-  stopifnot(identical(shap_obj$predictors, colnames(shap_vals)),
-            nrow(shap_vals) == 69530L, ncol(shap_vals) == 18L,
-            "pct_age_65_plus" %in% colnames(shap_vals))
-  shap_age <- shap_vals[, "pct_age_65_plus"]
-
-
-  g <- read_csv(file.path(dir_tbl, "07_shap_global.csv"), show_col_types = FALSE)
-  ma <- apply(abs(shap_vals), 2, mean)
-  stopifnot(nrow(g) == ncol(shap_vals))
-  stopifnot(max(abs(ma[g$feature] - g$mean_abs)) < 1e-12)
-  message(sprintf("SHAP cache verified against the SHAP importance table (max |diff| %.2e)",
-                  max(abs(ma[g$feature] - g$mean_abs))))
-
-  # ---------------------------------------------------------------------------
-  # 2. Rebuild the estimation frame IN THE ORDER THE SHAP ROWS ASSUME
-  # ---------------------------------------------------------------------------
-  an <- readRDS(file.path(dir_proc, "02_ckm_index.rds"))
-  if (inherits(an, "sf")) an <- sf::st_drop_geometry(an)
-  geo <- readRDS(file.path(dir_proc, "01_tracts_geo.rds"))
-  gdf <- sf::st_drop_geometry(geo)[, c("GEOID", "ALAND")]
-
-  conus <- gdf |>
-    dplyr::inner_join(an, by = "GEOID") |>
-    dplyr::filter(!substr(GEOID, 1, 2) %in%
-                    c("02", "15", "60", "66", "69", "72", "78")) |>
-    dplyr::filter(ALAND > 0, !is.na(ckm_core_pca))
-
-
-  CORE <- intersect(c("pct_age_65_plus", "pct_hispanic", "ice_income",
-                      "pct_unemployed", "pct_bachelor_plus", "ice_race",
-                      "pct_living_alone", "ACCESS2", "CHECKUP", "ruca_class",
-                      "pct_no_vehicle", "CSMOKING", "LPA"), names(an))
-  ENV <- intersect(ENV_PRED, names(an))
-
-  mod <- conus |>
-    dplyr::mutate(ruca_class = factor(ruca_class,
-                    levels = c("Metro", "Micropolitan", "Small town", "Rural"))) |>
-
-    tidyr::drop_na(ckm_core_pca, pct_age_65_plus, ice_race, ice_income,
-                   ruca_class, pct_hispanic, pct_black, pct_bachelor_plus,
-                   median_income) |>
-    tidyr::drop_na(dplyr::all_of(c("ckm_core_pca", CORE, ENV)))
-
-  X_full <- model.matrix(
-    stats::as.formula(paste("~", paste(c(CORE, ENV), collapse = " + "), "- 1")),
-    data = mod)
-  stopifnot(nrow(X_full) == nrow(shap_vals),
-            identical(colnames(X_full), colnames(shap_vals)))
-  message(sprintf("Estimation frame rebuilt: n = %d, %d features, column order identical",
-                  nrow(X_full), ncol(X_full)))
-
-  # ---------------------------------------------------------------------------
-  # 3. Native measurement scale for the axes
-  # ---------------------------------------------------------------------------
-  to_native <- function(v, x) if (v == "o3_8hrmax_4thmax") x * 1000 else x
-
-  interaction_df <- purrr::map_dfr(ENV, function(v) {
-    vals <- mod[[v]]
-    tibble::tibble(env_var   = v,
-                   env_value = to_native(v, vals),
-                   shap_age  = shap_age,
-                   age_value = mod$pct_age_65_plus,
-                   is_binary = length(unique(vals[!is.na(vals)])) <= 2)
-  })
-  cont_df <- dplyr::filter(interaction_df, !is_binary)
-  bin_df  <- dplyr::filter(interaction_df,  is_binary)
-  stopifnot(nrow(bin_df) > 0,
-            identical(sort(unique(bin_df$env_var)), "LILATracts_1And10"))
-
-  o3r <- range(cont_df$env_value[cont_df$env_var == "o3_8hrmax_4thmax"])
-  stopifnot(o3r[1] > 20, o3r[2] < 200)
-
-  # ---------------------------------------------------------------------------
-  # 4. THE GATE: every drawn summary must reproduce the archived companion data
-  # ---------------------------------------------------------------------------
-  arch <- read_csv(F_CSV, show_col_types = FALSE)
-  worst <- 0
-  for (v in unique(cont_df$env_var)) {
-    d <- cont_df |> dplyr::filter(env_var == v, is.finite(env_value),
-                                  is.finite(shap_age))
-    fit <- stats::loess(shap_age ~ env_value, data = d, span = 0.5)
-    gx  <- seq(min(d$env_value), max(d$env_value), length.out = 25)
-    ls  <- as.numeric(stats::predict(fit, newdata = data.frame(env_value = gx)))
-    a   <- arch |> dplyr::filter(env_var == v) |> dplyr::arrange(x)
-    stopifnot(nrow(a) == 25L, a$n_panel[1] == nrow(d))
-    dx <- max(abs(gx - a$x)); dl <- max(abs(ls - a$loess_shap))
-    worst <- max(worst, dx, dl)
-    message(sprintf("  %-18s n=%5d  max|dx|=%.2e  max|d loess|=%.2e",
-                    v, nrow(d), dx, dl))
-    stopifnot(dx < 1e-8, dl < 1e-8)
-  }
-  ab <- arch |> dplyr::filter(panel == "binary")
-  db <- bin_df |> dplyr::filter(is.finite(shap_age)) |>
-    dplyr::group_by(env_value) |>
-    dplyr::summarise(n = dplyr::n(), med = stats::median(shap_age),
-                     q25 = stats::quantile(shap_age, .25),
-                     q75 = stats::quantile(shap_age, .75), .groups = "drop")
-  for (i in seq_len(nrow(ab))) {
-    r <- db |> dplyr::filter(env_value == ifelse(ab$level[i] == "LILA", 1, 0))
-    stopifnot(nrow(r) == 1L, r$n == ab$n_panel[i])
-    dd <- max(abs(c(r$med - ab$median_shap[i], r$q25 - ab$q25_shap[i],
-                    r$q75 - ab$q75_shap[i])))
-    worst <- max(worst, dd)
-    message(sprintf("  %-18s n=%5d  max|d box|=%.2e", ab$level[i], r$n, dd))
-    stopifnot(dd < 1e-8)
-  }
-  message(sprintf("GATE PASSED: figure reproduces its archived companion data to %.2e",
-                  worst))
-
-  # ---------------------------------------------------------------------------
-  # 5. Draw, with the title, subtitle and ozone label
-  # ---------------------------------------------------------------------------
-  NEW_TITLE <- "Dependence of the aging SHAP attribution on environmental predictors"
-  NEW_SUB <- paste0(
-    "Descriptive dependence of the aging SHAP contribution on each exposure.\n",
-    "A non-flat trend is consistent with an interaction but does not isolate one:\n",
-    "it can also arise from predictor correlation or main-effect nonlinearity.")
-  
-  stopifnot(!grepl("⇒", NEW_SUB), !grepl("=>", NEW_SUB, fixed = TRUE),
-            grepl("does not isolate one", NEW_SUB, fixed = TRUE))
-
-  for (ln in strsplit(NEW_SUB, "\n", fixed = TRUE)[[1]])
-    stopifnot(nchar(ln) <= 90)
-
-  p_cont <- ggplot(cont_df, aes(x = env_value, y = shap_age, colour = age_value)) +
-    geom_point(alpha = 0.2, size = 0.4) +
-    geom_smooth(colour = "black", se = FALSE, method = "loess",
-                formula = y ~ x, span = 0.5) +
-    facet_wrap(~ env_var, scales = "free_x", ncol = 2,
-               labeller = ggplot2::as_labeller(.label_fig8)) +
-    scale_colour_viridis_c(name = "% age 65+") +
-    labs(x = "Environmental predictor value (original measurement scale)",
-         y = "SHAP value for % adults age 65+",
-         subtitle = "Continuous exposures — loess trend") +
-    theme_ckm
-
-  p_bin <- ggplot(bin_df,
-                  aes(x = factor(env_value, levels = c("0", "1"),
-                                 labels = c("Not LILA", "LILA")),
-                      y = shap_age, fill = factor(env_value))) +
-    geom_violin(alpha = 0.4, scale = "width", colour = NA) +
-    geom_boxplot(width = 0.15, outlier.alpha = 0.05, fill = "white") +
-    facet_wrap(~ env_var, ncol = 2,
-               labeller = ggplot2::as_labeller(.label_fig8)) +
-    scale_fill_manual(values = c("0" = "#2166AC", "1" = "#B2182B"),
-                      guide = "none") +
-    labs(x = "Tract food-access status",
-         y = "SHAP value for % adults age 65+",
-         subtitle = "Binary exposure — violin + boxplot") +
-    theme_ckm
-
-  p_interact <- p_cont / p_bin +
-    patchwork::plot_layout(heights = c(2, 1)) +
-    patchwork::plot_annotation(title = NEW_TITLE, subtitle = NEW_SUB)
-
-  # ---------------------------------------------------------------------------
-  # 6. Write. Dimensions are pinned
-  # ---------------------------------------------------------------------------
-  if (!WRITE) {
-    message("\nDRY RUN -- nothing written. Re-run with --write.")
-    return(invisible(NULL))
-  }
-
-  old_png <- readBin(F_PNG, "raw", file.info(F_PNG)$size)
-  bak <- file.path(dir_fig, sprintf("07_age_env_interactions.bak_%s.png",
-                                    format(Sys.time(), "%Y%m%d_%H%M%S")))
-  writeBin(old_png, bak)
-
-  ggsave(F_PNG, p_interact, width = 9, height = 8, dpi = 220, bg = "white")
-
-  d <- png::readPNG(F_PNG)
-  stopifnot(dim(d)[2] == 1980L, dim(d)[1] == 1760L)
-
-
-  ink <- d[, , 1] < 0.5
-  margin_hits <- which(apply(ink[, (dim(d)[2] - 11):dim(d)[2], drop = FALSE], 1, any))
-  if (length(margin_hits))
-    stop(sprintf("subtitle/label clipped at right edge: ink in final 12 px on %d row(s), first at y=%d",
-                 length(margin_hits), margin_hits[1]))
-  message(sprintf("right-margin check clear (rightmost ink at x=%d of %d)",
-                  max(which(apply(ink, 2, any))), dim(d)[2]))
-  message(sprintf("\nwrote %s (%d x %d px)", basename(F_PNG), dim(d)[2], dim(d)[1]))
-  message(sprintf("backup %s", basename(bak)))
-
- 
-  arch2 <- arch |>
-    dplyr::mutate(label = unname(fig8_pretty[env_var]))
-  stopifnot(nrow(arch2) == nrow(arch),
-            identical(arch2$x, arch$x),
-            identical(arch2$loess_shap, arch$loess_shap),
-            identical(arch2$median_shap, arch$median_shap),
-            all(arch2$label[arch2$env_var == "o3_8hrmax_4thmax"] ==
-                  "Annual 4th-highest 8-hr O₃ (ppb)"))
-  readr::write_csv(arch2, F_CSV)
-  message(sprintf("wrote %s (values byte-identical, ozone label in ppb)",
-                  basename(F_CSV)))
-
-}
-environment(.stage) <- new.env(parent = globalenv())
-.run_stage("14_interaction_figure.R", .stage)
-
 # ---- stage: 15_moran_check.R ----
 .stage <- function() {
  
@@ -7889,7 +5322,7 @@ environment(.stage) <- new.env(parent = globalenv())
   #          data/processed/01_tracts_geo.rds
   #          data/processed/09b_precision_weighted_model2.rds   (sample check)
   #          data/processed/09b_pw_m2_graph.adj                 (graph check)
-  #          output/tables/06_6g_coefficients_bym2_nobehav.csv  (published M1)
+  #          output/tables/06_6g_coefficients_bym2_nobehav.csv  (Model 1 fit)
   # OUTPUTS  data/processed/16_spline_lila_interaction.rds
   #          output/tables/16_spline_lila_contrasts.csv
   #          output/tables/16_spline_lila_modelfit.csv
@@ -8094,12 +5527,9 @@ environment(.stage) <- new.env(parent = globalenv())
   rhs_B <- paste(c(NS,                BASE, AGEENV, NSL),        collapse = " + ")
   rhs_C <- paste(c(QD,                BASE, AGEENV, QDL),        collapse = " + ")
 
-  fitA <- fit_bym2("A  LINEAR (published Model 1 spec)",   rhs_A, lc_linear)
-  saveRDS(fitA$summary.fixed, file.path(dir_proc, "16_partial_A.rds"))
+  fitA <- fit_bym2("A  LINEAR (Model 1 spec)",   rhs_A, lc_linear)
   fitB <- fit_bym2("B  SPLINE (natural cubic, df = 4)",    rhs_B, lc_spline)
-  saveRDS(fitB$summary.fixed, file.path(dir_proc, "16_partial_B.rds"))
   fitC <- fit_bym2("C  QUINTILE (5 groups)",               rhs_C, lc_quint)
-  saveRDS(fitC$summary.fixed, file.path(dir_proc, "16_partial_C.rds"))
 
   # ---------------------------------------------------------------------------
   # 6. Validation gate:
@@ -8132,13 +5562,13 @@ environment(.stage) <- new.env(parent = globalenv())
     Refit     = fitA$summary.fixed[xw[have], "mean"],
     row.names = NULL)
   val$Abs_diff <- val$Refit - val$Published
-  message("\n--- Validation: fit A vs published Model 1 ---")
+  message("\n--- Validation: fit A vs primary Model 1 ---")
   print(val, digits = 4, row.names = FALSE)
   message(sprintf("max |diff| = %.2e", max(abs(val$Abs_diff))))
   write.csv(val, file.path(dir_tab, "16_spline_lila_validation.csv"),
             row.names = FALSE)
   if (max(abs(val$Abs_diff)) > 1e-3)
-    warning("fit A departs from the published Model 1 by more than 1e-3; ",
+    warning("fit A departs from the primary Model 1 by more than 1e-3; ",
             "treat every comparison below as unvalidated")
 
   # ---------------------------------------------------------------------------
@@ -8200,8 +5630,6 @@ environment(.stage) <- new.env(parent = globalenv())
     n = nrow(mod)),
     file.path(dir_proc, "16_spline_lila_interaction.rds"))
 
-  for (f in sprintf("16_partial_%s.rds", c("A", "B", "C")))
-    unlink(file.path(dir_proc, f))
   message(sprintf("\nSaved. Total elapsed %.1f min",
                   as.numeric(difftime(Sys.time(), t_start, units = "mins"))))
 
@@ -8546,7 +5974,7 @@ environment(.stage) <- new.env(parent = globalenv())
   print(out, digits = 6, row.names = FALSE)
   write.csv(out, file.path(dir_tab, "17_lila_signchange.csv"), row.names = FALSE)
   cat("\nsaved: output/tables/17_lila_signchange.csv\n")
-  cat(sprintf("\nMANUSCRIPT VALUES\n  Model 1 sign change: %.1f%% aged 65+  (%.1f%% of tracts below)\n  Model 2 sign change: %.1f%% aged 65+  (%.1f%% of tracts below)\n",
+  cat(sprintf("\nSUMMARY VALUES\n  Model 1 sign change: %.1f%% aged 65+  (%.1f%% of tracts below)\n  Model 2 sign change: %.1f%% aged 65+  (%.1f%% of tracts below)\n",
               a1, 100 * mean(a < a1), a2, 100 * mean(a < a2)))
 
 }
@@ -8669,955 +6097,6 @@ environment(.stage) <- new.env(parent = globalenv())
 }
 environment(.stage) <- new.env(parent = globalenv())
 .run_stage("19_behavioral_indicator_split.R", .stage)
-
-# ---- stage: 20_regional_variance.R ----
-.stage <- function() {
-  # =============================================================================
-  # 20_regional_variance.R
-
-  # OUTPUT  output/tables/20_regional_variance.csv
-  # =============================================================================
-
-  suppressMessages({ library(dplyr); library(tidyr); library(sf) })
-
-  root <- getwd()
-  if (!dir.exists(file.path(root, "data")) &&
-      dir.exists(file.path(root, "..", "data"))) root <- normalizePath(file.path(root, ".."))
-  dir_proc <- file.path(root, "data", "processed")
-  dir_tab  <- file.path(root, "output", "tables")
-  stopifnot(dir.exists(dir_proc))
-
-  CORE_PRED <- c("pct_age_65_plus", "pct_hispanic", "ice_income",
-                 "pct_bachelor_plus", "ice_race", "ACCESS2", "CHECKUP",
-                 "ruca_class", "CSMOKING", "LPA")
-  ENV_PRED  <- c("pm25_annual", "o3_8hrmax_4thmax", "LILATracts_1And10",
-                 "tmax_warm", "walk_index")
-
-  an <- readRDS(file.path(dir_proc, "02_ckm_index.rds"))
-  if (inherits(an, "sf")) an <- st_drop_geometry(an)
-  geo <- readRDS(file.path(dir_proc, "01_tracts_geo.rds"))
-  d   <- an |> left_join(st_drop_geometry(geo)[, c("GEOID", "ALAND")], by = "GEOID")
-  mod <- d |>
-    filter(!substr(GEOID, 1, 2) %in% c("02", "15", "60", "66", "69", "72", "78")) |>
-    filter(ALAND > 0, !is.na(ckm_core_pca)) |>
-    mutate(ruca_class = factor(ruca_class,
-             levels = c("Metro", "Micropolitan", "Small town", "Rural"))) |>
-    drop_na(ckm_core_pca, pct_age_65_plus, ice_race, ice_income, ruca_class,
-            pct_hispanic, pct_black, pct_bachelor_plus, median_income) |>
-    drop_na(all_of(c("ckm_core_pca", CORE_PRED, ENV_PRED)))
-  stopifnot(nrow(mod) == 69530L)                                           # G1
-  pw <- readRDS(file.path(dir_proc, "09b_precision_weighted_model2.rds"))
-  stopifnot(identical(as.character(mod$GEOID), as.character(pw$weights$GEOID)))  # G2
-
-  state <- factor(substr(mod$GEOID, 1, 2))
-
-  stopifnot(nlevels(state) == 48L)
-  stopifnot(!("34" %in% levels(state)))
-  stopifnot(all(c("06", "48", "36", "12") %in% levels(state)))  # CA TX NY FL present
-
-  between_share <- function(x) {
-    x <- as.numeric(x)
-    gm <- mean(x)
-    ssb <- sum(tapply(x, state, function(v) length(v) * (mean(v) - gm)^2))
-    sst <- sum((x - gm)^2)
-    ssb / sst
-  }
-
-  VARS <- c(aging      = "pct_age_65_plus",
-            pm25       = "pm25_annual",
-            ozone      = "o3_8hrmax_4thmax",
-            heat       = "tmax_warm",
-            walkability= "walk_index",
-            lila       = "LILATracts_1And10",
-            ice_income = "ice_income",
-            ice_race   = "ice_race")
-
-  res <- data.frame(
-    variable = names(VARS),
-    column   = unname(VARS),
-    between_state_share = vapply(unname(VARS), function(v) between_share(mod[[v]]),
-                                 numeric(1)),
-    row.names = NULL)
-  res$within_state_share <- 1 - res$between_state_share
-  res <- res[order(-res$between_state_share), ]
-
-
-  stopifnot(all(res$between_state_share >= 0), all(res$between_state_share <= 1))
-
-
-  aging <- res$between_state_share[res$variable == "aging"]
-  envs  <- res$between_state_share[res$variable %in%
-                                     c("pm25", "ozone", "heat")]
-
-  print(res, digits = 4, row.names = FALSE)
-  write.csv(res, file.path(dir_tab, "20_regional_variance.csv"), row.names = FALSE)
-  cat("\nsaved: output/tables/20_regional_variance.csv\n")
-  cat(sprintf("\nAging between-state share: %.3f\n", aging))
-  cat(sprintf("Environmental main effects: min %.3f  max %.3f\n",
-              min(envs), max(envs)))
-  cat(sprintf("\nVERDICT: aging is %s regionally structured than the LEAST\n",
-              ifelse(aging > min(envs), "MORE", "LESS")))
-  cat(sprintf("         regionally structured environmental exposure (%.3f).\n",
-              min(envs)))
-  cat(ifelse(aging > min(envs),
-    "  -> the caution's environmental-only scope is NOT defensible on scale grounds.\n",
-    "  -> the caution's environmental-only scope IS defensible on scale grounds.\n"))
-
-}
-environment(.stage) <- new.env(parent = globalenv())
-.run_stage("20_regional_variance.R", .stage)
-
-# ---- stage: 22_senior_access_sensitivity.R ----
-.stage <- function() {
-  # =============================================================================
-  # 22_senior_access_sensitivity.R
-  #
-
-  suppressMessages({library(dplyr); library(readxl)})
-
-  .root <- getwd()
-  if (!dir.exists(file.path(.root, "data")) &&
-      dir.exists(file.path(.root, "..", "data")))
-    .root <- normalizePath(file.path(.root, ".."))
-
-  dir_tab <- file.path(.root, "output", "tables")
-  FARA    <- file.path(.root, "data", "raw", "fara_2019.xlsx")
-  stopifnot(file.exists(FARA))
-
-  s   <- ckm_sample()
-  mod <- s$mod
-
-  # ---------------------------------------------------------------------------
-  # 1. Read 
-  # ---------------------------------------------------------------------------
-  message("\nreading FARA senior columns...")
-  fa <- read_excel(FARA, sheet = "Food Access Research Atlas",
-                   col_types = "text", .name_repair = "minimal") |>
-    select(CensusTract, Pop2010, TractSeniors, laseniors1, laseniors1share,
-           lapop1, LILATracts_1And10)
-
-
-  null_sr  <- fa$laseniors1 == "NULL"
-  null_pop <- fa$lapop1     == "NULL"
-  message(sprintf("  laseniors1 'NULL': %d   lapop1 'NULL': %d   identical set: %s",
-                  sum(null_sr), sum(null_pop), identical(null_sr, null_pop)))
-  stopifnot(sum(null_sr) == 19989L)
-  if (!identical(null_sr, null_pop))
-    stop("laseniors1 and lapop1 NULL row sets differ; the 21_fara_null_check.py ",
-         "finding does not transfer and the recode is not licensed.",
-         call. = FALSE)
-
-  num <- function(x) as.numeric(ifelse(x == "NULL", "0", x))
-
- 
-  n_ts_null <- sum(fa$TractSeniors == "NULL")
-  stopifnot(n_ts_null == 4L)
-  fa <- fa |>
-    mutate(GEOID       = CensusTract,
-           TractSeniors = as.numeric(ifelse(TractSeniors == "NULL", NA,
-                                            TractSeniors)),
-           laseniors1   = num(laseniors1),
-           sr_share_pub = num(laseniors1share) / 100,   
-           LILA_raw     = as.numeric(LILATracts_1And10))
-  message(sprintf("  TractSeniors 'NULL': %d (denominator unknown, held as NA)",
-                  n_ts_null))
-
-
-  fa$sr_ratio <- ifelse(!is.na(fa$TractSeniors) & fa$TractSeniors > 0,
-                        fa$laseniors1 / fa$TractSeniors, NA)
-  stopifnot(all(fa$sr_ratio <= 1 + 1e-6, na.rm = TRUE))
-
-  d <- mod |> left_join(fa[, c("GEOID", "TractSeniors", "sr_share_pub",
-                               "sr_ratio", "LILA_raw")], by = "GEOID")
-  stopifnot(nrow(d) == nrow(mod))
-
- 
-  if (!identical(as.numeric(d$LILA_raw), as.numeric(d$LILATracts_1And10)))
-    stop("FARA join mismatch: LILA re-read from the workbook differs from the ",
-         "LILA in the estimation sample. The join is on the wrong rows.",
-         call. = FALSE)
-  message("  join OK: LILA re-read from raw is identical to the sample column")
-
-  
-  n_zero <- sum(!is.na(d$TractSeniors) & d$TractSeniors == 0)
-  n_nats <- sum(is.na(d$TractSeniors))
-  message(sprintf("  ratio undefined for %d of %d sample rows (%d with zero ",
-                  n_zero + n_nats, nrow(d), n_zero),
-          sprintf("seniors, %d with unknown senior count)", n_nats))
-  stopifnot(sum(is.na(d$sr_ratio)) == n_zero + n_nats)
-
-  # ---------------------------------------------------------------------------
-  # 2. What do the two senior measures actually measure?
-  # ---------------------------------------------------------------------------
- 
-  cr <- function(v) cor(d[[v]], d$pct_age_65_plus, use = "complete.obs")
-  n_ok <- sum(!is.na(d$sr_ratio))
-
-  meas <- data.frame(
-    measure = c("laseniors1share (FARA published, / tract population)",
-                "laseniors1 / TractSeniors (correctly denominated)",
-                "LILATracts_1And10 (binary, low-income AND low-access)"),
-    variable = c("sr_share_pub", "sr_ratio", "LILATracts_1And10"),
-    n_defined = c(sum(!is.na(d$sr_share_pub)), n_ok,
-                  sum(!is.na(d$LILATracts_1And10))),
-    mean = c(mean(d$sr_share_pub, na.rm = TRUE), mean(d$sr_ratio, na.rm = TRUE),
-             mean(d$LILATracts_1And10)),
-    sd = c(sd(d$sr_share_pub, na.rm = TRUE), sd(d$sr_ratio, na.rm = TRUE),
-           sd(d$LILATracts_1And10)),
-    cor_with_pct_age_65_plus = c(cr("sr_share_pub"), cr("sr_ratio"),
-                                 cr("LILATracts_1And10")),
-    row.names = NULL)
-
-  message("\n--- what each senior access measure is correlated with ---")
-  print(meas |> select(variable, n_defined, mean, sd, cor_with_pct_age_65_plus),
-        digits = 3, row.names = FALSE)
-  write.csv(meas, file.path(dir_tab, "22_senior_access_measures.csv"),
-            row.names = FALSE)
-
-  # ---------------------------------------------------------------------------
-  # 3. Does an access-only measure reproduce the interaction?
-  # ---------------------------------------------------------------------------
-
-  sub  <- d |> filter(!is.na(sr_ratio))
-  BASE <- paste(c(M1_PRED, setdiff(ENV_PRED, "LILATracts_1And10"),
-                  paste0("pct_age_65_plus:",
-                         setdiff(ENV_PRED, "LILATracts_1And10"))),
-                collapse = " + ")
-
-  specs <- list(
-    A_LILA_published = "LILATracts_1And10 + pct_age_65_plus:LILATracts_1And10",
-    B_ratio_only     = "sr_ratio + pct_age_65_plus:sr_ratio",
-    C_share_pub_only = "sr_share_pub + pct_age_65_plus:sr_share_pub",
-    D_both           = paste("LILATracts_1And10 + sr_ratio +",
-                             "pct_age_65_plus:LILATracts_1And10 +",
-                             "pct_age_65_plus:sr_ratio"))
-
-  rows <- list()
-  for (nm in names(specs)) {
-    f <- lm(as.formula(paste("ckm_core_pca ~", BASE, "+", specs[[nm]])), data = sub)
-    cf <- summary(f)$coefficients
-    keep <- grep("^(pct_age_65_plus$|LILATracts_1And10$|sr_ratio$|sr_share_pub$|pct_age_65_plus:(LILA|sr_))",
-                 rownames(cf), value = TRUE)
-    rows[[nm]] <- data.frame(spec = nm, n = nobs(f), r2 = summary(f)$r.squared,
-                             term = keep, beta = cf[keep, 1], se = cf[keep, 2],
-                             p = cf[keep, 4], row.names = NULL)
-  }
-  
-  fA_full <- lm(as.formula(paste("ckm_core_pca ~", BASE, "+", specs$A_LILA_published)),
-                data = d)
-  cfA <- summary(fA_full)$coefficients
-  keepA <- grep("^(pct_age_65_plus$|LILATracts_1And10$|pct_age_65_plus:LILA)",
-                rownames(cfA), value = TRUE)
-  rows[["A_LILA_full_sample"]] <- data.frame(
-    spec = "A_LILA_full_sample", n = nobs(fA_full),
-    r2 = summary(fA_full)$r.squared, term = keepA, beta = cfA[keepA, 1],
-    se = cfA[keepA, 2], p = cfA[keepA, 4], row.names = NULL)
-
-  coef_tbl <- bind_rows(rows)
-  message("\n--- aging x access interaction under four measures (same rows) ---")
-  print(coef_tbl, digits = 4, row.names = FALSE)
-  write.csv(coef_tbl, file.path(dir_tab, "22_senior_access_coefficients.csv"),
-            row.names = FALSE)
-
-  # ---------------------------------------------------------------------------
-  # 4. The comparison stated as a testable claim, recorded either way
-  # ---------------------------------------------------------------------------
-  g <- function(sp, tm) coef_tbl$beta[coef_tbl$spec == sp & coef_tbl$term == tm]
-  lila_A  <- g("A_LILA_published", "pct_age_65_plus:LILATracts_1And10")
-  ratio_B <- g("B_ratio_only",     "pct_age_65_plus:sr_ratio")
-  lila_D  <- g("D_both",           "pct_age_65_plus:LILATracts_1And10")
-  ratio_D <- g("D_both",           "pct_age_65_plus:sr_ratio")
-
-  message(sprintf(
-    paste0("\naging x LILA alone      %+.5f",
-           "\naging x senior ratio alone %+.5f",
-           "\njointly:  LILA %+.5f   senior ratio %+.5f"),
-    lila_A, ratio_B, lila_D, ratio_D))
-  message(sprintf(
-    "\npublished share correlates r = %+.3f with %% aged >=65; the correctly",
-    meas$cor_with_pct_age_65_plus[1]))
-  message(sprintf("denominated ratio correlates r = %+.3f.",
-                  meas$cor_with_pct_age_65_plus[2]))
-  message("\nwrote output/tables/22_senior_access_{measures,coefficients}.csv")
-
-}
-environment(.stage) <- new.env(parent = .ckm_env)
-.run_stage("22_senior_access_sensitivity.R", .stage)
-
-# ---- stage: 23_state_fe_heat.R ----
-.stage <- function() {
-  # =============================================================================
-  # 23_state_fe_heat.R
- 
-  # OUTPUTS  output/tables/23_state_fe_variance.csv
-  #          output/tables/23_state_fe_coefficients.csv
-  #          data/processed/23_bym2_state_fe.rds
-  # =============================================================================
-  suppressMessages({library(dplyr); library(tidyr)})
-
-  .root <- getwd()
-  if (!dir.exists(file.path(.root, "data")) &&
-      dir.exists(file.path(.root, "..", "data")))
-    .root <- normalizePath(file.path(.root, ".."))
-
-  OLS_ONLY <- "--ols-only" %in% commandArgs(TRUE)
-  dir_tab  <- file.path(.root, "output", "tables")
-  dir_proc <- file.path(.root, "data", "processed")
-
-  s   <- ckm_sample()
-  mod <- s$mod
-  RHS <- paste(c(M1_PRED, ENV_PRED, paste0("pct_age_65_plus:", ENV_PRED)),
-               collapse = " + ")
-
-  # ---------------------------------------------------------------------------
-  # 1. How much of each predictor lives between states?
-  # ---------------------------------------------------------------------------
- 
-  vars <- c("pct_age_65_plus", "pct_hispanic", "ice_income", "pct_bachelor_plus",
-            "ice_race", ENV_PRED)
-  vshare <- vapply(vars, function(v) {
-    a <- anova(lm(mod[[v]] ~ factor(mod$state)))
-    100 * a[1, 2] / sum(a[, 2])
-  }, numeric(1))
-  var_tbl <- data.frame(predictor = vars, pct_variance_between_state = vshare,
-                        row.names = NULL) |> arrange(desc(pct_variance_between_state))
-  message("\n--- between-state variance share ---")
-  print(var_tbl, digits = 3, row.names = FALSE)
-
-  # ---------------------------------------------------------------------------
-  # 2. OLS, with and without state fixed effects
-  # ---------------------------------------------------------------------------
-  fit_ols   <- lm(as.formula(paste("ckm_core_pca ~", RHS)), data = mod)
-  fit_ols_fe <- lm(as.formula(paste("ckm_core_pca ~", RHS, "+ factor(state)")),
-                   data = mod)
-
-  grab <- function(f, prefix) {
-    cf <- summary(f)$coefficients
-    keep <- rownames(cf)[!grepl("^factor\\(state\\)", rownames(cf))]
-    setNames(data.frame(term = keep, cf[keep, 1], cf[keep, 2], cf[keep, 4],
-                        row.names = NULL),
-             c("term", paste0(prefix, c("_beta", "_se", "_p"))))
-  }
-  ols_tbl <- full_join(grab(fit_ols, "ols"), grab(fit_ols_fe, "ols_fe"),
-                       by = "term") |>
-    mutate(ols_retained_pct = 100 * ols_fe_beta / ols_beta)
-
-  message(sprintf("\n--- OLS  R2 = %.4f (no FE)  %.4f (state FE) ---",
-                  summary(fit_ols)$r.squared, summary(fit_ols_fe)$r.squared))
-  print(ols_tbl |> select(term, ols_beta, ols_fe_beta, ols_retained_pct, ols_fe_p),
-        digits = 4, row.names = FALSE)
-
-  write.csv(var_tbl, file.path(dir_tab, "23_state_fe_variance.csv"),
-            row.names = FALSE)
-
- 
-  amb <- ols_tbl |> filter(term %in% c("tmax_warm", "pm25_annual",
-                                       "o3_8hrmax_4thmax"))
-  age <- ols_tbl |> filter(term == "pct_age_65_plus")
-  message(sprintf(
-    "\ns4.3 prediction: ambient terms retain %.0f-%.0f%% of their OLS effect; ",
-    min(amb$ols_retained_pct), max(amb$ols_retained_pct)))
-  message(sprintf("                 %% age >=65 retains %.0f%%.",
-                  age$ols_retained_pct))
-
-  if (OLS_ONLY) {
-    write.csv(ols_tbl, file.path(dir_tab, "23_state_fe_coefficients.csv"),
-              row.names = FALSE)
-    message("\n--ols-only: stopping before the INLA stage.")
-    return(invisible(NULL))
-  }
-
-  # ---------------------------------------------------------------------------
-  # 3. BYM2 with state fixed effects -- the primary specification
-  # ---------------------------------------------------------------------------
-  stopifnot(requireNamespace("INLA", quietly = TRUE))
-  message(sprintf("\nFitting BYM2 + state FE (n = %d)...", nrow(mod)))
-  t0 <- Sys.time()
-  fml <- as.formula(paste0(
-    "ckm_core_pca ~ ", RHS, " + factor(state)",
-    " + f(idarea, model = 'bym2', graph = '", s$graph_file, "',",
-    " scale.model = TRUE,",
-    " hyper = list(phi  = list(prior = 'pc', param = c(0.5, 0.5)),",
-    "              prec = list(prior = 'pc.prec', param = c(1, 0.01))))"))
-  fit <- .inla_isl(fml, data = mod, family = "gaussian",
-                    control.predictor = list(compute = TRUE),
-                    control.compute   = list(dic = TRUE, waic = TRUE,
-                                             return.marginals.predictor = FALSE),
-                    control.inla      = list(strategy = "adaptive",
-                                             int.strategy = "eb"),
-                    verbose = FALSE)
-  message(sprintf("  done in %.1f min",
-                  as.numeric(difftime(Sys.time(), t0, units = "mins"))))
-
-  saveRDS(list(summary_fixed = fit$summary.fixed,
-               summary_hyperpar = fit$summary.hyperpar,
-               dic = fit$dic$dic, waic = fit$waic$waic,
-               n = nrow(mod), GEOID = mod$GEOID,
-               formula = deparse(fml)),
-          file.path(dir_proc, "23_bym2_state_fe.rds"))
-
-  
-  pub <- s$ref$summary_fixed
-  rf  <- fit$summary.fixed
-  shared <- intersect(rownames(pub), rownames(rf))
-  stopifnot(length(shared) >= 15)
-
-  bym_tbl <- data.frame(
-    term        = shared,
-    bym2_beta   = pub[shared, "mean"],
-    bym2_lo     = pub[shared, "0.025quant"],
-    bym2_hi     = pub[shared, "0.975quant"],
-    bym2fe_beta = rf[shared, "mean"],
-    bym2fe_lo   = rf[shared, "0.025quant"],
-    bym2fe_hi   = rf[shared, "0.975quant"],
-    row.names = NULL) |>
-    mutate(bym2_credible   = (bym2_lo > 0)   == (bym2_hi > 0),
-           bym2fe_credible = (bym2fe_lo > 0) == (bym2fe_hi > 0),
-           sign_flip = sign(bym2_beta) != sign(bym2fe_beta),
-           retained_pct = 100 * bym2fe_beta / bym2_beta)
-
-  message("\n--- BYM2: no FE (validated refit) vs + state FE ---")
-  print(bym_tbl |> select(term, bym2_beta, bym2fe_beta, retained_pct,
-                          bym2fe_credible, sign_flip),
-        digits = 4, row.names = FALSE)
-  message(sprintf("\nDIC  no FE %.1f -> state FE %.1f", s$ref$dic, fit$dic$dic))
-  message(sprintf("WAIC no FE %.1f -> state FE %.1f", s$ref$waic, fit$waic$waic))
-
-  out <- full_join(ols_tbl, bym_tbl, by = "term")
-  write.csv(out, file.path(dir_tab, "23_state_fe_coefficients.csv"),
-            row.names = FALSE)
-  message("\nwrote output/tables/23_state_fe_coefficients.csv")
-
-}
-environment(.stage) <- new.env(parent = .ckm_env)
-.run_stage("23_state_fe_heat.R", .stage)
-
-# ---- stage: 24_spatial_plus.R ----
-.stage <- function() {
-  # =============================================================================
-  # 24_spatial_plus.R
-
-  # OUTPUTS  output/tables/24_spatial_plus_smooths.csv
-  #          output/tables/24_spatial_plus_coefficients.csv
-  #          data/processed/24_bym2_spatial_plus.rds
-  # =============================================================================
-  suppressMessages({library(dplyr); library(sf); library(mgcv)})
-
-  .root <- getwd()
-  if (!dir.exists(file.path(.root, "data")) &&
-      dir.exists(file.path(.root, "..", "data")))
-    .root <- normalizePath(file.path(.root, ".."))
-
-  dir_tab  <- file.path(.root, "output", "tables")
-  dir_proc <- file.path(.root, "data", "processed")
-  K_SMOOTH <- 200L
-
-  s   <- ckm_sample()
-  mod <- s$mod
-
-  # ---------------------------------------------------------------------------
-  # 1. Spatial basis and per-covariate residualization
-  # ---------------------------------------------------------------------------
-  xy <- suppressWarnings(st_coordinates(st_centroid(st_geometry(s$geo))))
-  stopifnot(nrow(xy) == nrow(mod), st_crs(s$geo)$epsg == 5070L)
-  mod$cx <- xy[, 1]; mod$cy <- xy[, 2]
-
-  CONT <- c(setdiff(M1_PRED, "ruca_class"), ENV_PRED)   
-  stopifnot(!"ruca_class" %in% CONT, "LILATracts_1And10" %in% CONT)
-
-  message(sprintf("\nresidualizing %d covariates on a thin-plate basis (k = %d)...",
-                  length(CONT), K_SMOOTH))
-  sm <- list()
-  for (v in CONT) {
-    b <- bam(as.formula(paste(v, "~ s(cx, cy, bs = 'tp', k =", K_SMOOTH, ")")),
-             data = mod, discrete = TRUE)
-    r <- as.numeric(residuals(b))
-    sm[[v]] <- data.frame(
-      covariate = v,
-      dev_expl_by_space = summary(b)$dev.expl,
-      sd_original = sd(mod[[v]]),
-      sd_residual = sd(r),
-      sd_ratio = sd(r) / sd(mod[[v]]))
-    mod[[paste0(v, "_sp")]] <- r
-  }
-  sm_tbl <- bind_rows(sm) |> arrange(desc(dev_expl_by_space))
-  message("\n--- how much of each covariate is smooth spatial structure? ---")
-  print(sm_tbl, digits = 3, row.names = FALSE)
-  write.csv(sm_tbl, file.path(dir_tab, "24_spatial_plus_smooths.csv"),
-            row.names = FALSE)
-
-  # ---------------------------------------------------------------------------
-  # 2-3. Two BYM2 refits on the residualized covariates
-  # ---------------------------------------------------------------------------
-  stopifnot(requireNamespace("INLA", quietly = TRUE))
-
-  sp <- function(v) paste0(v, "_sp")
-  main_sp <- c(sp(setdiff(M1_PRED, "ruca_class")), "ruca_class", sp(ENV_PRED))
-
- 
-  int_res <- paste0(sp("pct_age_65_plus"), ":", sp(ENV_PRED))
-  int_org <- paste0("pct_age_65_plus:", ENV_PRED)
-
-  fit_one <- function(rhs, label) {
-    fml <- as.formula(paste0(
-      "ckm_core_pca ~ ", rhs,
-      " + f(idarea, model = 'bym2', graph = '", s$graph_file, "',",
-      " scale.model = TRUE,",
-      " hyper = list(phi  = list(prior = 'pc', param = c(0.5, 0.5)),",
-      "              prec = list(prior = 'pc.prec', param = c(1, 0.01))))"))
-    message(sprintf("\nfitting %s (n = %d)...", label, nrow(mod)))
-    t0 <- Sys.time()
-    f <- .inla_isl(fml, data = mod, family = "gaussian",
-                    control.predictor = list(compute = TRUE),
-                    control.compute   = list(dic = TRUE, waic = TRUE,
-                                             return.marginals.predictor = FALSE),
-                    control.inla      = list(strategy = "adaptive",
-                                             int.strategy = "eb"),
-                    verbose = FALSE)
-    message(sprintf("  done in %.1f min",
-                    as.numeric(difftime(Sys.time(), t0, units = "mins"))))
-    f
-  }
-
-  fit_r <- fit_one(paste(c(main_sp, int_res), collapse = " + "),
-                   "spatial+ (interactions = products of residuals)")
-  fit_o <- fit_one(paste(c(main_sp, int_org), collapse = " + "),
-                   "spatial+ (interactions = products of originals)")
-
-  saveRDS(list(smooths = sm_tbl,
-               resid_int = list(summary_fixed = fit_r$summary.fixed,
-                                dic = fit_r$dic$dic, waic = fit_r$waic$waic),
-               orig_int  = list(summary_fixed = fit_o$summary.fixed,
-                                dic = fit_o$dic$dic, waic = fit_o$waic$waic),
-               n = nrow(mod), k_smooth = K_SMOOTH, GEOID = mod$GEOID),
-          file.path(dir_proc, "24_bym2_spatial_plus.rds"))
-
-  # ---------------------------------------------------------------------------
-  # 4. Assemble, on both scales
-  # ---------------------------------------------------------------------------
- 
-  unsp <- function(x) gsub("_sp\\b", "", gsub("_sp:", ":", x))
-
-  pull <- function(f, pre) {
-    d <- f$summary.fixed
-    data.frame(term = unsp(rownames(d)), m = d[, "mean"],
-               lo = d[, "0.025quant"], hi = d[, "0.975quant"], row.names = NULL) |>
-      setNames(c("term", paste0(pre, c("_beta", "_lo", "_hi"))))
-  }
-
-  pub <- s$ref$summary_fixed
-  base <- data.frame(term = rownames(pub), bym2_beta = pub[, "mean"],
-                     bym2_lo = pub[, "0.025quant"],
-                     bym2_hi = pub[, "0.975quant"], row.names = NULL)
-
-  out <- base |> full_join(pull(fit_r, "spres"), by = "term") |>
-    full_join(pull(fit_o, "sporg"), by = "term")
-  stopifnot(sum(is.na(out$spres_beta)) == 0, sum(is.na(out$bym2_beta)) == 0)
-
- 
-  sd_of <- function(term, resid) {
-    parts <- strsplit(term, ":", fixed = TRUE)[[1]]
-    if (any(parts == "(Intercept)") || grepl("^ruca_class", term)) return(NA_real_)
-    v <- sapply(parts, function(p) {
-      if (!p %in% CONT) return(NA_real_)
-      if (resid) sd(mod[[sp(p)]]) else sd(mod[[p]])
-    })
-    if (anyNA(v)) NA_real_ else prod(v)
-  }
-  out$sd_published <- vapply(out$term, sd_of, numeric(1), resid = FALSE)
-  out$sd_spatialplus_resid <- vapply(out$term, sd_of, numeric(1), resid = TRUE)
-  out <- out |>
-    mutate(bym2_beta_per_sd  = bym2_beta  * sd_published,
-           spres_beta_per_sd = spres_beta * sd_spatialplus_resid,
-           sporg_beta_per_sd = sporg_beta * sd_published,
-           spres_credible = (spres_lo > 0) == (spres_hi > 0),
-           sporg_credible = (sporg_lo > 0) == (sporg_hi > 0),
-           sign_flip_res  = sign(bym2_beta) != sign(spres_beta),
-           retained_pct_per_sd = 100 * spres_beta_per_sd / bym2_beta_per_sd)
-
-  message("\n--- BYM2 published vs spatial+ (per SD of the regressor used) ---")
-  print(out |> select(term, bym2_beta_per_sd, spres_beta_per_sd,
-                      retained_pct_per_sd, spres_credible, sign_flip_res),
-        digits = 3, row.names = FALSE)
-  message(sprintf("\nDIC  published %.1f | spatial+ resid-int %.1f | orig-int %.1f",
-                  s$ref$dic, fit_r$dic$dic, fit_o$dic$dic))
-  message(sprintf("WAIC published %.1f | spatial+ resid-int %.1f | orig-int %.1f",
-                  s$ref$waic, fit_r$waic$waic, fit_o$waic$waic))
-
-  write.csv(out, file.path(dir_tab, "24_spatial_plus_coefficients.csv"),
-            row.names = FALSE)
-  message("\nwrote output/tables/24_spatial_plus_{smooths,coefficients}.csv")
-
-}
-environment(.stage) <- new.env(parent = .ckm_env)
-.run_stage("24_spatial_plus.R", .stage)
-
-# ---- stage: 25_county_anchor.R ----
-.stage <- function() {
-  # =============================================================================
-  # 25_county_anchor.R
- 
-  # OUTPUTS  output/tables/25_county_anchor.csv
-  #          output/figures/25_county_anchor.png
-  # =============================================================================
-  suppressMessages({library(dplyr); library(tidyr); library(sf)})
-
-  .root <- getwd()
-  if (!dir.exists(file.path(.root, "data")) &&
-      dir.exists(file.path(.root, "..", "data")))
-    .root <- normalizePath(file.path(.root, ".."))
-
-  dir_raw <- file.path(.root, "data", "raw")
-  dir_tab <- file.path(.root, "output", "tables")
-  dir_fig <- file.path(.root, "output", "figures")
-
-  # ---------------------------------------------------------------------------
-  # 1. Locate an independent county outcome
-  # ---------------------------------------------------------------------------
-  CAND <- c(wonder = "wonder_county_ckm_mortality.txt",
-            cms    = "cms_county_chronic.csv",
-            generic = "county_outcome.csv")
-  found <- CAND[file.exists(file.path(dir_raw, CAND))]
-
-  if (length(found) == 0) {
-    message("\n", strrep("-", 74))
-    message("25_county_anchor.R: NO INDEPENDENT COUNTY OUTCOME ON DISK.")
-    message(strrep("-", 74))
-    message("Checked data/raw/ for:")
-    for (f in CAND) message("    ", f)
-    message("")
-    message("This script deliberately does not substitute a PLACES-derived")
-    message("measure. A PLACES county rate would be the same small-area model")
-    message("aggregated, which is the very thing being tested -- the test would")
-    message("pass by construction and mean nothing.")
-    message("")
-    message("Download one of the sources named in this file's header, save it")
-    message("under data/raw/ with the matching filename, and re-run.")
-    message(strrep("-", 74))
-    return(invisible(NULL))
-  }
-  src_kind <- names(found)[1]
-  src_file <- file.path(dir_raw, found[1])
-  message("county outcome source: ", found[1], "  (", src_kind, ")")
-
-  read_outcome <- function(kind, path) {
-    if (kind == "wonder") {
-      ln <- readLines(path, warn = FALSE)
-
-      cut <- which(grepl("^\"?---", ln))
-      if (length(cut) == 0)
-        stop("no '---' notes block: this does not look like a raw WONDER ",
-             "export. Re-download and do not re-save it in Excel.",
-             call. = FALSE)
-      d <- read.delim(text = paste(ln[seq_len(cut[1] - 1L)], collapse = "\n"),
-                      stringsAsFactors = FALSE, check.names = TRUE)
-      fips_col <- grep("^County.Code$", names(d), value = TRUE)
-      rate_col <- grep("Age.Adjusted.Rate|Crude.Rate", names(d), value = TRUE)
-      if (!length(fips_col) || !length(rate_col))
-        stop("WONDER export lacks County Code and/or a rate column; got: ",
-             paste(names(d), collapse = ", "), call. = FALSE)
-      out <- data.frame(county_fips = sprintf("%05s", trimws(d[[fips_col]])),
-                        rate_raw = trimws(as.character(d[[rate_col[1]]])),
-                        stringsAsFactors = FALSE)
-
-      out$suppressed <- !grepl("^[0-9.]+$", out$rate_raw)
-      out$rate <- suppressWarnings(as.numeric(out$rate_raw))
-      out
-    } else {
-      d <- read.csv(path, stringsAsFactors = FALSE, colClasses = "character")
-      fips_col <- grep("fips|county.code|County.Code", names(d),
-                       ignore.case = TRUE, value = TRUE)
-      rate_col <- grep("rate|prevalence", names(d), ignore.case = TRUE,
-                       value = TRUE)
-      if (!length(fips_col) || !length(rate_col))
-        stop("CSV needs a FIPS-like and a rate/prevalence-like column; got: ",
-             paste(names(d), collapse = ", "), call. = FALSE)
-      message("  using columns: fips = ", fips_col[1], ", rate = ", rate_col[1])
-      out <- data.frame(
-        county_fips = sprintf("%05s", trimws(d[[fips_col[1]]])),
-        rate = suppressWarnings(as.numeric(trimws(d[[rate_col[1]]]))),
-        stringsAsFactors = FALSE)
-      out$suppressed <- is.na(out$rate)
-      out
-    }
-  }
-
-  oc <- read_outcome(src_kind, src_file)
-  stopifnot(nrow(oc) > 0)
-  if (any(nchar(oc$county_fips) != 5))
-    stop("county FIPS are not all 5 characters after padding -- the file was ",
-         "probably opened and re-saved in Excel, which strips leading zeros.",
-         call. = FALSE)
-  message(sprintf("  %d county rows, %d suppressed/unusable (%.1f%%)",
-                  nrow(oc), sum(oc$suppressed),
-                  100 * mean(oc$suppressed)))
-
-  # ---------------------------------------------------------------------------
-  # 2. Population-weighted county aggregation of the estimation sample
-  # ---------------------------------------------------------------------------
-
-  s   <- ckm_sample()
-  mod <- s$mod
-  mod$w <- ifelse(is.na(mod$total_pop) | mod$total_pop == 0, 1, mod$total_pop)
-
-  DEMO <- c("pct_age_65_plus", "pct_hispanic", "ice_income",
-            "pct_bachelor_plus", "ice_race")
-
-  cty <- mod |>
-    mutate(county_fips = substr(GEOID, 1, 5)) |>
-    group_by(county_fips) |>
-    summarise(across(all_of(c("ckm_core_pca", DEMO)),
-                     ~ stats::weighted.mean(.x, w = w, na.rm = TRUE)),
-              pop = sum(w, na.rm = TRUE), n_tracts = dplyr::n(),
-              .groups = "drop")
-  message(sprintf("counties from the estimation sample: %d", nrow(cty)))
-
-  d <- inner_join(cty, oc[, c("county_fips", "rate", "suppressed")],
-                  by = "county_fips") |>
-    filter(!suppressed, is.finite(rate)) |>
-    drop_na(all_of(c("ckm_core_pca", DEMO, "rate", "pop")))
-  message(sprintf("matched, unsuppressed, complete: %d counties (%.1f%% of the ",
-                  nrow(d), 100 * nrow(d) / nrow(cty)),
-          "estimation sample's counties)")
-  if (nrow(d) < 200)
-    stop("only ", nrow(d), " counties matched -- check the FIPS format in ",
-         basename(src_file), " before trusting anything downstream.",
-         call. = FALSE)
-
-
-  kept <- cty$county_fips %in% d$county_fips
-  message(sprintf("  retained counties hold %.1f%% of the sample population",
-                  100 * sum(cty$pop[kept]) / sum(cty$pop)))
-
-  # ---------------------------------------------------------------------------
-  # 3. The anchor
-  # ---------------------------------------------------------------------------
-  r_p <- cor(d$ckm_core_pca, d$rate, method = "pearson")
-  r_s <- cor(d$ckm_core_pca, d$rate, method = "spearman")
-  ct  <- cor.test(d$ckm_core_pca, d$rate, method = "pearson")
-
-  fml_d  <- as.formula(paste("rate ~", paste(DEMO, collapse = " + ")))
-  fml_di <- as.formula(paste("rate ~", paste(c(DEMO, "ckm_core_pca"),
-                                             collapse = " + ")))
-  m_d  <- lm(fml_d,  data = d, weights = pop)
-  m_di <- lm(fml_di, data = d, weights = pop)
-
-  r2_d   <- summary(m_d)$r.squared
-  r2_di  <- summary(m_di)$r.squared
-  incr   <- r2_di - r2_d
-  av     <- anova(m_d, m_di)
-  p_incr <- av[["Pr(>F)"]][2]
-  b_ckm  <- coef(summary(m_di))["ckm_core_pca", ]
-
-
-  pr <- cor(residuals(lm(fml_d, data = d, weights = pop)),
-            residuals(lm(as.formula(paste("ckm_core_pca ~",
-                                          paste(DEMO, collapse = " + "))),
-                         data = d, weights = pop)))
-
-  cat("\n", strrep("=", 70), "\n", sep = "")
-  cat("COUNTY ANCHOR  (n = ", nrow(d), " counties)\n", sep = "")
-  cat(strrep("=", 70), "\n")
-  cat(sprintf("  raw Pearson  r = %+.3f  [%.3f, %.3f]  p = %.3g\n",
-              r_p, ct$conf.int[1], ct$conf.int[2], ct$p.value))
-  cat(sprintf("  raw Spearman r = %+.3f\n", r_s))
-  cat("\n  -- incremental over demographics (population-weighted) --\n")
-  cat(sprintf("  R2  demographics only        %.4f\n", r2_d))
-  cat(sprintf("  R2  demographics + CKM index %.4f\n", r2_di))
-  cat(sprintf("  incremental R2               %.4f   (F p = %.3g)\n",
-              incr, p_incr))
-  cat(sprintf("  partial r | demographics     %+.3f\n", pr))
-  cat(sprintf("  index beta                   %+.4f (SE %.4f, p = %.3g)\n",
-              b_ckm["Estimate"], b_ckm["Std. Error"], b_ckm["Pr(>|t|)"]))
-  cat("\n")
-
-  if (is.finite(p_incr) && p_incr < 0.05 && incr >= 0.01) {
-    cat("  READING: the index adds signal beyond demographics.\n")
-  } else {
-    cat("  READING: the index adds little or nothing beyond demographics.\n")
-    cat("  This is the adverse result. It does NOT invalidate the spatial\n")
-    cat("  models, but it does mean the index cannot be described as a health\n")
-    cat("  measure distinct from its demographic inputs, and s4.1 must say so.\n")
-  }
-  cat(strrep("=", 70), "\n")
-
-  # ---------------------------------------------------------------------------
-  # 4. Write out
-  # ---------------------------------------------------------------------------
-  out <- data.frame(
-    quantity = c("n_counties", "pct_sample_pop_retained", "pct_suppressed",
-                 "pearson_r", "pearson_lo", "pearson_hi", "pearson_p",
-                 "spearman_r", "r2_demographics", "r2_demographics_plus_index",
-                 "incremental_r2", "incremental_F_p", "partial_r_given_demo",
-                 "index_beta", "index_se", "index_p"),
-    value = c(nrow(d), 100 * sum(cty$pop[kept]) / sum(cty$pop),
-              100 * mean(oc$suppressed),
-              r_p, ct$conf.int[1], ct$conf.int[2], ct$p.value, r_s,
-              r2_d, r2_di, incr, p_incr, pr,
-              b_ckm["Estimate"], b_ckm["Std. Error"], b_ckm["Pr(>|t|)"]),
-    source = basename(src_file), source_kind = src_kind,
-    row.names = NULL)
-  write.csv(out, file.path(dir_tab, "25_county_anchor.csv"), row.names = FALSE)
-
-  png(file.path(dir_fig, "25_county_anchor.png"), width = 1600, height = 1400,
-      res = 200)
-  op <- par(mar = c(4.5, 4.5, 3, 1))
-
-  symbols(d$ckm_core_pca, d$rate, circles = sqrt(d$pop), inches = 0.16,
-          fg = grDevices::rgb(0, 0, 0, 0.25), bg = grDevices::rgb(0.2, 0.4, 0.7, 0.25),
-          xlab = "County CKM index (population-weighted tract mean)",
-          ylab = paste0("Independent county outcome (", src_kind, ")"),
-          main = sprintf("County anchor: r = %+.3f, incremental R2 = %.3f",
-                         r_p, incr))
-  abline(lm(rate ~ ckm_core_pca, data = d, weights = pop), col = "firebrick", lwd = 2)
-  par(op); invisible(dev.off())
-
-  message("\nwrote output/tables/25_county_anchor.csv")
-  message("wrote output/figures/25_county_anchor.png")
-
-}
-environment(.stage) <- new.env(parent = .ckm_env)
-.run_stage("25_county_anchor.R", .stage)
-
-
-# ---- stage: 26_lila_decomposition.R ----
-.stage <- function() {
-  # ===========================================================================
-  # 26_lila_decomposition.R -- split the binary LILA flag into its factors
-  
-  # OUTPUTS  output/tables/26_lila_decomposition_coefficients.csv
-  #          output/tables/26_lila_conjunction_check.csv
-
-  # ===========================================================================
-  suppressMessages({library(dplyr)})
-
-  .root <- getwd()
-  if (!dir.exists(file.path(.root, "data")) &&
-      dir.exists(file.path(.root, "..", "data")))
-    .root <- normalizePath(file.path(.root, ".."))
-  dir_tab <- file.path(.root, "output", "tables")
-  DO_SWEEP <- TRUE
-
-  s   <- ckm_sample()
-  mod <- s$mod
-
-  NEED <- c("LowIncomeTracts", "LATracts_half", "LATracts1",
-            "LATracts10", "LATracts20", "LILATracts_Vehicle")
-  miss <- setdiff(NEED, names(mod))
-  if (length(miss)) {
-    message("  MISSING from the estimation sample: ",
-            paste(miss, collapse = ", "))
-    message("  delete data/processed/01f_food_tract.rds and re-run section 1f;")
-    message("  it rebuilds 02_ckm_index.rds carrying these columns.")
-    return(invisible(NULL))
-  }
-
-
-  b01 <- function(x, nm) {
-    v  <- suppressWarnings(as.integer(as.character(x)))
-    na <- sum(is.na(v))
-    if (na)
-      stop(sprintf(paste0("%s: %d of %d values are NA or non-numeric. FARA ",
-                          "does not cover these tracts uniformly; decide on ",
-                          "a recode before fitting rather than letting INLA ",
-                          "drop them silently."),
-                   nm, na, length(v)))
-    bad <- setdiff(unique(v), c(0L, 1L))
-    if (length(bad))
-      stop(sprintf("%s: expected a 0/1 flag, also saw %s",
-                   nm, paste(sort(bad), collapse = ", ")))
-    v
-  }
-  for (v in c(NEED, "LILATracts_1And10")) mod[[v]] <- b01(mod[[v]], v)
-
-
-  recon <- as.integer(mod$LowIncomeTracts == 1L &
-                      (mod$LATracts1 == 1L | mod$LATracts10 == 1L))
-  agree <- mean(recon == mod$LILATracts_1And10)
-  xt    <- table(reconstructed = recon, published = mod$LILATracts_1And10)
-  message(sprintf("\n  LILA = LowIncome & (LA1 | LA10) reproduces %.4f of tracts",
-                  agree))
-  print(xt)
-  write.csv(as.data.frame(xt),
-            file.path(dir_tab, "26_lila_conjunction_check.csv"),
-            row.names = FALSE)
-
-  message(sprintf("  prevalence: LILA %.3f | LowIncome %.3f | LA1 %.3f | LA10 %.3f",
-                  mean(mod$LILATracts_1And10), mean(mod$LowIncomeTracts),
-                  mean(mod$LATracts1), mean(mod$LATracts10)))
-
-
-  OTHER   <- setdiff(ENV_PRED, "LILATracts_1And10")
-  bas_mn  <- c(M1_PRED, OTHER)
-  bas_int <- paste0("pct_age_65_plus:", OTHER)
-
-  fit_one <- function(food_mn, food_int, label) {
-    rhs <- paste(c(bas_mn, food_mn, bas_int, food_int), collapse = " + ")
-    fml <- as.formula(paste0(
-      "ckm_core_pca ~ ", rhs,
-      " + f(idarea, model = 'bym2', graph = '", s$graph_file, "',",
-      " scale.model = TRUE,",
-      " hyper = list(phi  = list(prior = 'pc', param = c(0.5, 0.5)),",
-      "              prec = list(prior = 'pc.prec', param = c(1, 0.01))))"))
-    message(sprintf("\n  fitting %s (n = %d)...", label, nrow(mod)))
-    t0 <- Sys.time()
-    f <- .inla_isl(fml, data = mod, family = "gaussian",
-                    control.predictor = list(compute = TRUE),
-                    control.compute   = list(dic = TRUE, waic = TRUE,
-                                             return.marginals.predictor = FALSE),
-                    control.inla      = list(strategy = "adaptive",
-                                             int.strategy = "eb"),
-                    verbose = FALSE)
-    message(sprintf("    done in %.1f min",
-                    as.numeric(difftime(Sys.time(), t0, units = "mins"))))
-    sf <- f$summary.fixed
-    data.frame(spec = label, term = rownames(sf),
-               beta = sf[, "mean"], lo95 = sf[, "0.025quant"],
-               hi95 = sf[, "0.975quant"],
-               dic = f$dic$dic, waic = f$waic$waic, row.names = NULL)
-  }
-
-  specs <- list(
-    list("LILATracts_1And10", "pct_age_65_plus:LILATracts_1And10",
-         "A_published_binary_LILA"),
-
-    list(c("LowIncomeTracts", "LATracts1", "LowIncomeTracts:LATracts1"),
-         c("pct_age_65_plus:LowIncomeTracts", "pct_age_65_plus:LATracts1",
-           "pct_age_65_plus:LowIncomeTracts:LATracts1"),
-         "B_decomposed_income_x_access1"))
-
-  if (DO_SWEEP)
-    for (v in c("LATracts_half", "LATracts10", "LATracts20"))
-      specs[[length(specs) + 1L]] <- list(
-        c("LowIncomeTracts", v, paste0("LowIncomeTracts:", v)),
-        c("pct_age_65_plus:LowIncomeTracts", paste0("pct_age_65_plus:", v),
-          paste0("pct_age_65_plus:LowIncomeTracts:", v)),
-        paste0("C_distance_", v))
-  if (DO_SWEEP)
-    specs[[length(specs) + 1L]] <- list(
-      "LILATracts_Vehicle", "pct_age_65_plus:LILATracts_Vehicle",
-      "D_vehicle_access")
-
-  out <- do.call(rbind, lapply(specs,
-                               function(p) fit_one(p[[1]], p[[2]], p[[3]])))
-  out$credible <- sign(out$lo95) == sign(out$hi95)
-
-  f_out <- file.path(dir_tab, "26_lila_decomposition_coefficients.csv")
-  write.csv(out, f_out, row.names = FALSE)
-  message("\n  wrote ", f_out)
-
-  cat("\n  food-access terms by specification:\n")
-  print(out |>
-          filter(grepl("LILA|LowIncome|LATracts", term)) |>
-          select(spec, term, beta, lo95, hi95, credible),
-        row.names = FALSE)
-
-  cat("\n  fit:\n")
-  print(out |> distinct(spec, dic, waic), row.names = FALSE)
-  invisible(NULL)
-}
-environment(.stage) <- new.env(parent = .ckm_env)
-.run_stage("26_lila_decomposition.R", .stage)
 
 # ---- stage: 27_heat_interannual.R ----
 .stage <- function() {
@@ -9751,7 +6230,7 @@ environment(.stage) <- new.env(parent = .ckm_env)
   # INPUTS.
   #   data/processed/02_ckm_index.rds              analytic + both indices
   #   data/processed/01_tracts_geo.rds             tract geometry (ALAND, coords)
-  #   data/processed/06_6g_inla_bym2_nobehav.rds   published Model 1 (core index)
+  #   data/processed/06_6g_inla_bym2_nobehav.rds   primary Model 1 (core index)
   #   data/processed/12_bym2_refit_model1.rds      Model 1 refit incl. random
   #                                                field + GEOID (stage 12)
   # OUTPUTS.
@@ -9820,7 +6299,7 @@ environment(.stage) <- new.env(parent = .ckm_env)
   m1p <- readRDS(file.path(dir_proc, "06_6g_inla_bym2_nobehav.rds"))
   stopifnot(nrow(mod) == m1p$n)                     # same 69,530 sample as Model 1
   stopifnot(!any(is.na(mod$ckm_ext_pca)))           # extended index adds NO attrition
-  message(sprintf("Estimation sample: n = %d (identical to published Model 1)",
+  message(sprintf("Estimation sample: n = %d (identical to primary Model 1)",
                   nrow(mod)))
 
   mod$o3_8hrmax_4thmax <- mod$o3_8hrmax_4thmax * 100     # ppm -> per-10-ppb
@@ -9879,9 +6358,9 @@ environment(.stage) <- new.env(parent = .ckm_env)
                   as.numeric(difftime(Sys.time(), t0, units = "mins"))))
 
   # ---------------------------------------------------------------------------
-  # 4. Coefficient comparison: extended vs published core Model 1
+  # 4. Coefficient comparison: extended vs primary core Model 1
   # ---------------------------------------------------------------------------
-  pf <- m1p$summary_fixed            # published core Model 1 (same spec, same n)
+  pf <- m1p$summary_fixed            # primary core Model 1 (same spec, same n)
   rf <- fit$summary.fixed
   stopifnot(setequal(rownames(pf), rownames(rf)))
   sh <- rownames(rf)
@@ -9938,7 +6417,7 @@ environment(.stage) <- new.env(parent = .ckm_env)
   # BYM2 total random effect = first n rows of summary.random$idarea
   re_ext <- fit$summary.random$idarea$mean[seq_len(n)]
 
-  # Published Model 1 random field from the stage-12 refit (carries GEOID)
+  # Primary Model 1 random field from the stage-12 refit (carries GEOID)
   ref1   <- readRDS(file.path(dir_proc, "12_bym2_refit_model1.rds"))
   stopifnot(!is.null(ref1$summary_random), !is.null(ref1$GEOID))
   re_core_full <- ref1$summary_random$mean[seq_len(length(ref1$GEOID))]
@@ -10020,17 +6499,17 @@ environment(.stage) <- new.env(parent = .ckm_env)
 .stage <- function() {
   # 29_derived_tables.R
   #
-  # Computes, from cached PUBLISHED objects only (no model is refit), derived
-  # quantities the manuscript reports, each written to its own table:
+  # Computes, from cached SAVED objects only (no model is refit), derived
+  # quantities the article reports, each written to its own table:
   #   (1) residual Moran's I of the full-covariate (focal-only) OLS -- the
-  #       matched comparator for the ESF and focal+Wx fits (Supplemental Results,
-  #       ESF cross-check and Wx paragraphs). The six-predictor baseline OLS
+  #       matched comparator for the ESF fit (Supplemental Results,
+  #       ESF cross-check paragraph). The six-predictor baseline OLS
   #       has a different value (0.470);
-  #   (2) South / non-South summaries of the published Model 1 and Model 2 BYM2
+  #   (2) South / non-South summaries of the primary Model 1 and Model 2 BYM2
   #       random effects ("Post-adjustment Southern excess", Supplemental Results);
   #   (3) state means of those random effects;
   #   (4) the central-90% span of % age >= 65; (5) behavioral prevalence by
-  #   burden quintile; (6) the stage-12 refits' drift against the published fits
+  #   burden quintile; (6) the stage-12 refits' drift against the primary fits
   #   (coefficients, DIC, WAIC, BYM2 mixing parameter); (7) the baseline OLS
   #   coefficients.
   #
@@ -10065,7 +6544,7 @@ environment(.stage) <- new.env(parent = .ckm_env)
     moran_I = c(m_base, m_full, m_esf)),
     file.path(dir_tbl, "29_residual_moran_full_ols.csv"), row.names = FALSE)
 
-  # ---- (2)-(3) regional and state summaries of the published random effects --
+  # ---- (2)-(3) regional and state summaries of the primary random effects --
   geo <- sf::st_drop_geometry(rd("01_tracts_geo.rds"))
   geo$GEOID <- trimws(as.character(geo$GEOID))
   south <- c("01","05","10","11","12","13","21","22","24","28","37","40","45",
@@ -10129,9 +6608,9 @@ environment(.stage) <- new.env(parent = .ckm_env)
   }))
   write.csv(bq, file.path(dir_tbl, "29_behavior_by_burden_quintile.csv"), row.names = FALSE)
 
-  # ---- (6) cross-session drift of the stage-12 refits against the published fits
+  # ---- (6) cross-session drift of the stage-12 refits against the primary fits
   #          (Supplement methods, Staten Island intercept section). Computed from the
-  #          cached objects, so the comparison always uses the published fits that
+  #          cached objects, so the comparison always uses the primary fits that
   #          every reported coefficient comes from.
   pairs <- list("Model 1" = c(pub = "06_6g_inla_bym2_nobehav.rds", refit = "12_bym2_refit_model1.rds"),
                 "Model 2" = c(pub = "06_inla_bym2.rds",            refit = "12_bym2_refit_model2.rds"))
@@ -10153,7 +6632,7 @@ environment(.stage) <- new.env(parent = .ckm_env)
       phi_mean_refit = hr[["mean"]], phi_sd_refit = hr[["sd"]])
   }
   dterm <- do.call(rbind, dterm); dsum <- do.call(rbind, dsum)
-  # the published side must be the BYM2 coefficient table's own sources, the refit side stage 12's own output
+  # the primary side must be the BYM2 coefficient table's own sources, the refit side stage 12's own output
   pub_csv <- rbind(data.frame(model = "Model 1", read.csv(file.path(dir_tbl, "06_6g_coefficients_bym2_nobehav.csv"))[, 1:2]),
                    data.frame(model = "Model 2", read.csv(file.path(dir_tbl, "06_coefficients_bym2.csv"))[, 1:2]))
   chk <- merge(dterm, pub_csv, by.x = c("model", "term"), by.y = c("model", "predictor"))
@@ -10223,7 +6702,7 @@ environment(.stage) <- new.env(parent = .ckm_env)
   DF_SPLINE <- 4L
   PCTS      <- c(.10, .25, .50, .75, .90, .95)
 
-  # ---- 1. estimation sample (identical rows and order to the published fits)
+  # ---- 1. estimation sample (identical rows and order to the primary fits)
   s   <- ckm_sample()
   mod <- s$mod
   graph_file <- s$graph_file
@@ -10328,7 +6807,7 @@ environment(.stage) <- new.env(parent = .ckm_env)
   print(agree, digits = 3, row.names = FALSE)
 
   # ---- 4. models (conditional-contrast machinery, food-environment term swapped)
-  age <- mod$pct_age_65_plus                          # centred, as published
+  age <- mod$pct_age_65_plus                          # centred, as in the primary fit
   mod$age_pm25 <- age * mod$pm25_annual
   mod$age_o3   <- age * mod$o3_8hrmax_4thmax
   mod$age_tmax <- age * mod$tmax_warm
@@ -10477,7 +6956,6 @@ environment(.stage) <- new.env(parent = .ckm_env)
     "Model 1" = first(core & L$n_fixed == 20 & has("~ pct_age_65_plus \\+") &
                         !has("ACCESS2")),
     "Model 2" = first(core & L$n_fixed == 24 & has("ACCESS2")),
-    "Focal + Wx" = first(core & L$n_fixed == 33 & has("ACCESS2")),
     "Extended index, Model 1 spec" = first(L$outcome == "ckm_ext_pca"),
     "B0 spline df=4 main, linear interaction" = first(core & has("~ s4_ns1")),
     "B spline df=4 main and interaction" = first(core & L$n_fixed == 26 & has("~ age_ns1")),
@@ -10498,7 +6976,7 @@ environment(.stage) <- new.env(parent = .ckm_env)
   dr <- function(lab) { r <- pick[[lab]]; v(r$te_mode, r$tau_mode, r$phi_mode, r$mlik_int) }
   sr <- function(lab, st) { r <- S[S$label == lab & S$start == st, ]; stopifnot(nrow(r) == 1L)
     v(r$te_mode, r$tau_mode, r$phi_mode, r$mlik_int) }
-  specs <- c("A linear (primary)", names(pick)[5:10])
+  specs <- c("A linear (primary)", names(pick)[4:9])
   A <- do.call(rbind, lapply(specs, function(lab) {
     k <- if (lab == specs[1]) "Model 1" else lab
     rbind(cbind(spec = lab, start = "default", dr(k)),
@@ -10511,8 +6989,6 @@ environment(.stage) <- new.env(parent = .ckm_env)
     cbind(model = "Model 1", start = "third", sr("A linear (primary)", "second")),
     cbind(model = "Model 2", start = "default", dr("Model 2")),
     cbind(model = "Model 2", start = "second", sr("Model 2", "second")),
-    cbind(model = "Focal + Wx", start = "default", dr("Focal + Wx")),
-    cbind(model = "Focal + Wx", start = "second", sr("Focal + Wx", "second")),
     cbind(model = "Extended index, Model 1 spec", start = "default",
           dr("Extended index, Model 1 spec")),
     cbind(model = "Extended index, Model 1 spec", start = "second",
@@ -10631,20 +7107,14 @@ local({
       paste(sprintf("%.2f", attr(sp$spline_basis, "Boundary.knots") + sp$age_mean_raw),
             collapse = ", "), "\n")
 
-  # 5. Semivariogram of OLS residuals (5,000-tract subsample, 50-km bins)
-  v <- readRDS(file.path(dp, "06_5d_residual_variogram.rds"))
-  cat("5. Semivariogram bins:\n")
-  print(data.frame(km = round(v$dist / 1000), gamma = round(v$gamma, 3), pairs = v$np),
-        row.names = FALSE)
-
-  # 6. Tract geometries with no PLACES estimate (land tracts, New Jersey excluded)
+  # 5. Tract geometries with no PLACES estimate (land tracts, New Jersey excluded)
   g <- st_drop_geometry(readRDS(file.path(dp, "01_tracts_geo.rds")))
   p <- readRDS(file.path(dp, "01_places_tract.rds"))
   g$GEOID <- trimws(as.character(g$GEOID))
   nop <- !(g$GEOID %in% p$GEOID) & substr(g$GEOID, 1, 2) != "34" & g$ALAND > 0
-  cat("6. Suppressed tracts (no PLACES estimate) =", sum(nop), "\n")
+  cat("5. Suppressed tracts (no PLACES estimate) =", sum(nop), "\n")
 
-  # 7. Variance inflation factors (main effects) for the Model 1 and Model 2 covariate sets
+  # 6. Variance inflation factors (main effects) for the Model 1 and Model 2 covariate sets
   #    on the 69,530-tract estimation sample. OLS only; no BYM2 fit.
   ref$GEOID <- as.character(ref$GEOID)
   d <- ix[match(ref$GEOID, ix$GEOID), ]
@@ -10657,7 +7127,7 @@ local({
     v <- car::vif(lm(f, data = d))
     sort(v[, "GVIF^(1/(2*Df))"]^2, decreasing = TRUE)
   }
-  cat("7. VIF, Model 1 covariates (max", sprintf("%.2f", max(vif_of(f1))), "):\n")
+  cat("6. VIF, Model 1 covariates (max", sprintf("%.2f", max(vif_of(f1))), "):\n")
   print(round(vif_of(f1), 2))
   cat("   VIF, Model 2 covariates:\n")
   print(round(vif_of(f2), 2))
@@ -10732,7 +7202,7 @@ local({
   re_mean <- function(sv) { rd <- as.data.frame(sv$summary_random); stopifnot(nrow(rd) == 2 * N); head(rd$mean, N) }
   m_exc <- re_mean(bym2_nb_save); m_adj <- re_mean(bym2_save)
 
-  # same pairing check as stage 13 (residual spatial-effect map)
+  # pairing check: Southern means of the two random-effect surfaces
   SOUTH <- c("01","05","10","11","12","13","21","22","24","28","37","40","45","47","48","51","54")
   iss <- substr(GEO, 1, 2) %in% SOUTH
   stopifnot(round(mean(m_exc[iss]), 3) == 0.322, round(mean(m_adj[iss]), 3) == -0.042)
@@ -10824,7 +7294,7 @@ local({
 f_si <- file.path(dir_tbl, "sessionInfo.txt")
 si_con <- file(f_si, open = "wt")
 writeLines(c(
-  "# Environment for the published CKM_US run.",
+  "# Environment for the reported CKM_US run.",
   paste0("# Written automatically at the end of CKM_US_Main.R on ",
          format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), "."),
   paste0("# Platform: ", R.version$platform),
